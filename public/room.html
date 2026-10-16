@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Interview Room — WebCoder</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <style id="remoteCursorStyles"></style>
+</head>
+<body class="ide-body legacy-layout">
+
+  <!-- TOP BAR -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <a href="/" class="brand-mini" title="Back to Lobby">&lt;/&gt;</a>
+      <input type="text" id="roomTitleInput" class="room-title-input" value="Loading..." maxlength="80" title="Click to rename room" />
+      <span id="selfRoleBadge" class="role-badge" style="display: none;"></span>
+      <div class="divider-v"></div>
+      <button type="button" class="btn btn-subtle panel-toggle active" id="togglePromptBtn" title="Show/Hide Problem Prompt">◧ Problem</button>
+      <button type="button" class="btn btn-subtle panel-toggle active" id="toggleOutputBtn" title="Show/Hide Output">◨ Output</button>
+    </div>
+
+    <div class="topbar-center">
+      <button type="button" class="btn btn-run" id="runBtn" title="Run Code (Ctrl+Enter or Cmd+Enter)">
+        <span id="runBtnIcon">▶</span>
+        <span id="runBtnLabel">Run Code</span>
+      </button>
+      <div class="divider-v"></div>
+      <div class="timer-widget" title="Shared Interview Stopwatch">
+        <span id="timerDisplay" class="timer-display">00:00</span>
+        <button type="button" id="timerStartPauseBtn" class="timer-btn">Start</button>
+        <button type="button" id="timerResetBtn" class="timer-btn">Reset</button>
+      </div>
+    </div>
+
+    <div class="topbar-right">
+      <div class="users-menu" id="usersMenu">
+        <button type="button" class="btn btn-subtle users-menu-btn" id="usersBtn" title="Connected users">
+          <span class="users-icon">👥</span>
+          <span class="users-count" id="usersCount">0</span>
+        </button>
+        <div class="users-dropdown" id="usersDropdown"></div>
+      </div>
+      <button type="button" class="btn btn-subtle" id="inviteBtn">Copy Invite Link</button>
+    </div>
+  </header>
+
+  <!-- 3-PANE WORKSPACE -->
+  <main class="legacy-workspace" id="workspace">
+    <!-- Left Pane: Problem Prompt -->
+    <section class="legacy-pane legacy-pane-prompt" id="promptPane">
+      <div class="pane-header">
+        <div class="pane-title">
+          <button type="button" class="tab-btn active" id="promptPreviewTab">Preview</button>
+          <button type="button" class="tab-btn" id="promptEditTab">Edit Markdown</button>
+        </div>
+        <div class="pane-actions">
+          <button type="button" class="btn btn-subtle pane-collapse-btn" id="collapsePromptBtn" title="Collapse this panel">&laquo;</button>
+          <select id="presetPicker" class="mini-select">
+            <option value="">Load Preset...</option>
+            <option value="two-sum">Two Sum (Easy)</option>
+            <option value="lru-cache">LRU Cache (Medium)</option>
+            <option value="merge-intervals">Merge Intervals (Medium)</option>
+            <option value="number-of-islands">Number of Islands (Medium)</option>
+            <option value="blank">Blank / Custom</option>
+          </select>
+        </div>
+      </div>
+      <div class="prompt-body">
+        <div id="roleNotice" class="role-notice" style="display: none;"></div>
+        <div id="promptPreview" class="markdown-view"></div>
+        <textarea id="promptEditor" class="prompt-editor" style="display: none;" placeholder="Write problem description in Markdown..."></textarea>
+      </div>
+    </section>
+
+    <div class="resizer-v" id="resizerLeft"></div>
+
+    <!-- Center Pane: Code Editor -->
+    <section class="legacy-pane legacy-pane-editor" id="editorPane">
+      <div class="pane-header">
+        <div class="pane-title">
+          <div class="language-picker">
+            <label for="languageSelect">Language</label>
+            <select id="languageSelect" class="lang-select" title="Switch Room Language" aria-describedby="fileNameLabel">
+              <option value="python">Python 3 (3.11)</option>
+              <option value="javascript">JavaScript (Node.js)</option>
+              <option value="cpp">C++20 (GCC 12)</option>
+              <option value="java">Java 17 (OpenJDK)</option>
+              <option value="go">Go</option>
+              <option value="rust">Rust (rustc)</option>
+            </select>
+          </div>
+          <span id="fileNameLabel" style="font-family: var(--font-mono); text-transform: none; color: var(--text-primary);">main.py</span>
+          <span id="syncIndicator" style="font-size: 11px; color: #2fbf8f; text-transform: none; font-weight: 500;">● Live</span>
+        </div>
+        <div class="pane-actions">
+          <button type="button" class="btn btn-subtle" id="resetTemplateBtn" style="padding: 3px 8px; font-size: 11.5px;">Reset Starter Code</button>
+          <select id="fontSizeSelect" class="mini-select" title="Editor Font Size">
+            <option value="13">13px</option>
+            <option value="14" selected>14px</option>
+            <option value="16">16px</option>
+            <option value="18">18px</option>
+          </select>
+        </div>
+      </div>
+      <div id="editorContainer" class="editor-container"></div>
+    </section>
+
+    <div class="resizer-v" id="resizerRight"></div>
+
+    <!-- Right Pane: Execution Output + Stdin -->
+    <section class="legacy-pane legacy-pane-output" id="outputPane">
+      <div class="pane-header">
+        <div class="pane-title">Program Output</div>
+        <div class="pane-actions">
+          <button type="button" class="btn btn-subtle" id="clearOutputBtn" style="padding: 3px 8px; font-size: 11.5px;">Clear</button>
+          <button type="button" class="btn btn-subtle pane-collapse-btn" id="collapseOutputBtn" title="Collapse this panel">&raquo;</button>
+        </div>
+      </div>
+
+      <div id="outputScroll" class="output-scroll">
+        <div class="output-placeholder">
+          <div style="font-size: 22px; opacity: 0.5;">▶</div>
+          <div>Press <strong>Run Code</strong> or <code>Ctrl+Enter</code> to execute in the sandbox.</div>
+          <div style="font-size: 12px;">Output is shared in real time with everyone in the room.</div>
+        </div>
+      </div>
+
+      <div class="stdin-section" id="stdinSection">
+        <div class="stdin-header" id="stdinToggle">
+          <span>Custom Stdin (Standard Input)</span>
+          <span id="stdinArrow">▼</span>
+        </div>
+        <textarea id="stdinTextarea" class="stdin-textarea" placeholder="Optional input passed to stdin (sys.stdin / std::cin / Scanner / process.stdin)..."></textarea>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs/loader.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+[Unit]
+Description=WebCoder collaborative interview pad (Python/C++/Java)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dcem
+WorkingDirectory=/home/dcem/Projects/webcoder
+Environment=PORT=31311
+Environment=HOST=127.0.0.1
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=multi-user.target

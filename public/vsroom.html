@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VS Code Room — WebCoder</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <style>
+    html, body { height: 100%; overflow: hidden; }
+    .vs-body { display: flex; flex-direction: column; height: 100vh; }
+    .vs-bar {
+      height: 40px;
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 10px;
+      flex-shrink: 0;
+    }
+    .vs-bar .brand-mini { flex-shrink: 0; }
+    .vs-title { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+    .vs-frame {
+      flex: 1;
+      width: 100%;
+      border: none;
+      min-height: 0;
+      background: #fff;
+    }
+    .vs-loading {
+      position: absolute;
+      inset: 40px 0 0 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-secondary);
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div class="vs-body">
+    <div class="vs-bar">
+      <a href="/" class="brand-mini" title="Back to Lobby">&lt;/&gt;</a>
+      <span class="vs-title" id="vsTitle">Loading room...</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn btn-subtle" id="vsInviteBtn">Copy Invite Link</button>
+      <button type="button" class="btn btn-subtle" id="vsReloadBtn" title="Reload VS Code">↻ Reload</button>
+    </div>
+    <div class="vs-loading" id="vsLoading">Starting VS Code server… this can take a few seconds.</div>
+    <iframe class="vs-frame" id="vsFrame" style="display:none;" src=""></iframe>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script>
+    (() => {
+      const pathParts = window.location.pathname.split('/').filter(Boolean);
+      const roomId = pathParts[1] || 'default';
+      const frame = document.getElementById('vsFrame');
+      const loading = document.getElementById('vsLoading');
+      const title = document.getElementById('vsTitle');
+      const inviteBtn = document.getElementById('vsInviteBtn');
+      const reloadBtn = document.getElementById('vsReloadBtn');
+      const toastEl = document.getElementById('toast');
+
+      function showToast(msg) {
+        toastEl.textContent = msg;
+        toastEl.classList.add('show');
+        setTimeout(() => toastEl.classList.remove('show'), 2500);
+      }
+
+      // Open the room's persistent project folder instead of an empty window.
+      const workspaceParams = new URLSearchParams({ folder: '/home/workspace/interview' });
+      frame.src = `/vsroom/${encodeURIComponent(roomId)}/?${workspaceParams}`;
+      frame.addEventListener('load', () => {
+        loading.style.display = 'none';
+        frame.style.display = '';
+      });
+
+      inviteBtn.addEventListener('click', async () => {
+        const url = `${window.location.origin}/room/${roomId}`;
+        try { await navigator.clipboard.writeText(url); showToast('Room invite link copied!'); }
+        catch { prompt('Copy room invite link:', url); }
+      });
+
+      reloadBtn.addEventListener('click', () => {
+        loading.style.display = '';
+        frame.style.display = 'none';
+        frame.src = frame.src;
+      });
+
+      // Fetch the room title
+      fetch(`/api/rooms/${encodeURIComponent(roomId)}`)
+        .then((r) => r.json())
+        .then((d) => { if (d.room) { title.textContent = d.room.title; document.title = `${d.room.title} — WebCoder`; } })
+        .catch(() => {});
+    })();
+  </script>
+</body>
+</html>

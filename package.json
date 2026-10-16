@@ -1,0 +1,16 @@
+{
+  "name": "webcoder",
+  "version": "1.0.0",
+  "description": "Collaborative interview coding pad supporting Python, JavaScript, C++, Java, Go, and Rust with isolated container execution",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "build:sandbox": "podman build -t webcoder-sandbox:latest ./sandbox || docker build -t webcoder-sandbox:latest ./sandbox",
+    "build:vscode": "podman build -f sandbox/vscode.Dockerfile -t webcoder-vscode:latest ./sandbox || docker build -f sandbox/vscode.Dockerfile -t webcoder-vscode:latest ./sandbox"
+  },
+  "dependencies": {
+    "http-proxy": "^1.18.1",
+    "ws": "^8.18.0"
+  }
+}

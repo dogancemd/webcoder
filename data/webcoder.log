@@ -1,0 +1,2 @@
+WebCoder interview server running on http://127.0.0.1:31311
+Sandbox runtime: podman (image: webcoder-sandbox:latest)

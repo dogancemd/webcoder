@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebCoder — Collaborative Technical Interview Pad</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="lobby-wrapper">
+    <header class="lobby-header">
+      <a href="/" class="brand">
+        <div class="brand-icon">&lt;/&gt;</div>
+        <div class="brand-text">
+          <h1>WebCoder</h1>
+          <p>Real-Time Collaborative Interview Pad • Python, JavaScript, C++, Java, Go &amp; Rust</p>
+        </div>
+      </a>
+      <div class="sandbox-badge" id="sandboxStatus">
+        <span class="sandbox-dot"></span>
+        <span id="sandboxText">Container Sandbox Ready</span>
+      </div>
+    </header>
+
+    <div class="lobby-grid">
+      <!-- Create Room Card -->
+      <div class="card">
+        <h2 class="card-title">Start New Interview Pad</h2>
+        <p class="card-subtitle">Create a room and share the link with your friend to code together in real time.</p>
+
+        <form id="createRoomForm">
+          <div class="form-group">
+            <label for="userNameInput">Your Display Name</label>
+            <input type="text" id="userNameInput" class="input" placeholder="e.g. Alex" maxlength="32" />
+          </div>
+
+          <div class="form-group">
+            <label for="roomTitleInput">Interview / Room Title</label>
+            <input type="text" id="roomTitleInput" class="input" placeholder="e.g. Mock Interview with Sam" maxlength="80" />
+          </div>
+
+          <div class="form-group">
+            <label for="languageSelect">Starting Language</label>
+            <select id="languageSelect" class="select">
+              <option value="python">Python 3 (3.11)</option>
+              <option value="javascript">JavaScript (Node.js)</option>
+              <option value="cpp">C++ (GCC C++20)</option>
+              <option value="java">Java (OpenJDK 17)</option>
+              <option value="go">Go</option>
+              <option value="rust">Rust (rustc)</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="presetSelect">Problem Preset</label>
+            <select id="presetSelect" class="select">
+              <option value="blank" selected>Blank / Custom Interview Pad</option>
+              <option value="two-sum">Two Sum (Easy)</option>
+              <option value="lru-cache">LRU Cache (Medium)</option>
+              <option value="merge-intervals">Merge Intervals (Medium)</option>
+              <option value="number-of-islands">Number of Islands (Medium)</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="layoutSelect">Editor Layout</label>
+            <select id="layoutSelect" class="select">
+              <option value="legacy" selected>Classic CoderPad (3-pane)</option>
+              <option value="vscode-server">Real VS Code Server (code-server)</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="customIdInput">Custom Room Slug (Optional)</label>
+            <input type="text" id="customIdInput" class="input" placeholder="Leave blank for random slug" pattern="[a-zA-Z0-9_-]+" maxlength="40" />
+          </div>
+
+          <button type="submit" class="btn btn-primary" id="createBtn">
+            Create &amp; Enter Room →
+          </button>
+        </form>
+      </div>
+
+      <!-- Recent Rooms Card -->
+      <div class="card">
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px;">
+          <div>
+            <h2 class="card-title" style="margin-bottom: 2px;">Recent Interview Rooms</h2>
+            <p class="card-subtitle" style="margin-bottom: 0;">Jump back into an existing pad or copy its invite link.</p>
+          </div>
+          <button type="button" class="btn btn-subtle" id="refreshRoomsBtn">Refresh</button>
+        </div>
+
+        <div id="roomsList" class="rooms-list">
+          <div style="color: var(--text-muted); padding: 24px 0; text-align: center;">Loading rooms...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script>
+    const userNameInput = document.getElementById('userNameInput');
+    const roomTitleInput = document.getElementById('roomTitleInput');
+    const languageSelect = document.getElementById('languageSelect');
+    const presetSelect = document.getElementById('presetSelect');
+    const layoutSelect = document.getElementById('layoutSelect');
+    const customIdInput = document.getElementById('customIdInput');
+    const createRoomForm = document.getElementById('createRoomForm');
+    const roomsList = document.getElementById('roomsList');
+    const refreshRoomsBtn = document.getElementById('refreshRoomsBtn');
+    const sandboxText = document.getElementById('sandboxText');
+    const toastEl = document.getElementById('toast');
+
+    function showToast(msg) {
+      toastEl.textContent = msg;
+      toastEl.classList.add('show');
+      setTimeout(() => toastEl.classList.remove('show'), 2500);
+    }
+
+    // Load saved display name
+    const savedName = localStorage.getItem('webcoder_username') || '';
+    if (savedName) {
+      userNameInput.value = savedName;
+    }
+
+    userNameInput.addEventListener('change', () => {
+      const val = userNameInput.value.trim();
+      if (val) localStorage.setItem('webcoder_username', val);
+    });
+
+    async function fetchStatus() {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+        if (data.runtime) {
+          sandboxText.textContent = `Isolated ${data.runtime} Sandbox Active`;
+        }
+      } catch {}
+    }
+
+    function formatRelativeTime(ts) {
+      const diffSec = Math.floor((Date.now() - ts) / 1000);
+      if (diffSec < 60) return 'just now';
+      if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
+      if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`;
+      return new Date(ts).toLocaleDateString();
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
+    async function loadRooms() {
+      try {
+        const res = await fetch('/api/rooms');
+        const data = await res.json();
+        const rooms = data.rooms || [];
+        if (rooms.length === 0) {
+          roomsList.innerHTML = `
+            <div style="color: var(--text-muted); padding: 32px 16px; text-align: center; border: 1px dashed var(--border-color); border-radius: 8px;">
+              No rooms created yet. Use the form on the left to start your first interview pad!
+            </div>
+          `;
+          return;
+        }
+
+        roomsList.innerHTML = rooms.map((r) => {
+          const langLabel = { python: 'Python 3', javascript: 'Node.js', cpp: 'C++20', java: 'Java 17', go: 'Go', rust: 'Rust' }[r.language] || r.language;
+          const liveBadge = r.activeParticipants > 0
+            ? `<span class="live-pill">● ${r.activeParticipants} online</span>`
+            : '';
+          return `
+            <div class="room-item">
+              <div class="room-item-info">
+                <a href="/room/${encodeURIComponent(r.id)}" class="room-item-title">
+                  <span>${escapeHtml(r.title)}</span>
+                  <span class="lang-tag lang-${escapeHtml(r.language)}">${langLabel}</span>
+                  ${liveBadge}
+                </a>
+                <div class="room-item-meta">
+                  <span>/room/${escapeHtml(r.id)}</span>
+                  <span>•</span>
+                  <span>Updated ${formatRelativeTime(r.updatedAt)}</span>
+                  ${r.interviewerName ? `<span>•</span><span>Interviewer: ${escapeHtml(r.interviewerName)}</span>` : ''}
+                </div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 6px;">
+                <button type="button" class="btn btn-subtle" onclick="copyRoomLink('${escapeHtml(r.id)}')">Copy Link</button>
+                <a href="/room/${encodeURIComponent(r.id)}" class="btn btn-subtle" style="background: rgba(56, 189, 248, 0.12); color: #38bdf8; border-color: rgba(56, 189, 248, 0.3);">Join →</a>
+                <button type="button" class="btn btn-subtle" title="Delete room" onclick="deleteRoomById('${escapeHtml(r.id)}')" style="color: var(--text-muted);">✕</button>
+              </div>
+            </div>
+          `;
+        }).join('');
+      } catch (err) {
+        roomsList.innerHTML = `<div style="color: var(--accent-red);">Failed to load rooms.</div>`;
+      }
+    }
+
+    window.copyRoomLink = async (id) => {
+      const url = `${window.location.origin}/room/${id}`;
+      try {
+        await navigator.clipboard.writeText(url);
+        showToast('Invite link copied to clipboard!');
+      } catch {
+        prompt('Copy room link:', url);
+      }
+    };
+
+    window.deleteRoomById = async (id) => {
+      if (!confirm(`Delete interview room "${id}"?`)) return;
+      await fetch(`/api/rooms/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      showToast('Room deleted');
+      loadRooms();
+    };
+
+    createRoomForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const name = userNameInput.value.trim();
+      if (name) {
+        localStorage.setItem('webcoder_username', name);
+      }
+
+      const payload = {
+        title: roomTitleInput.value.trim(),
+        language: languageSelect.value,
+        layout: layoutSelect.value,
+        presetId: presetSelect.value,
+        customId: customIdInput.value.trim()
+      };
+
+      const res = await fetch('/api/rooms', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (data.room && data.room.id) {
+        // Mark this identity as the interviewer for the room they just created
+        try {
+          localStorage.setItem('webcoder_role_hint', JSON.stringify({
+            roomId: data.room.id,
+            role: 'interviewer',
+            t: Date.now()
+          }));
+        } catch {}
+        window.location.href = `/room/${encodeURIComponent(data.room.id)}`;
+      }
+    });
+
+    refreshRoomsBtn.addEventListener('click', loadRooms);
+
+    fetchStatus();
+    loadRooms();
+  </script>
+</body>
+</html>
