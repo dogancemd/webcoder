@@ -11,11 +11,22 @@ const {
   saveRoomState,
   listRecentRooms,
   deleteRoom,
+  getRoomPasswordHash,
+  setRoomPassword,
+  getSessionSecret,
   getRole,
   setRole,
   listRoles,
   hasRole
 } = require('./src/db');
+const {
+  ROOM_SESSION_TTL_MS,
+  verifyPassword,
+  roomCookieName,
+  signRoomToken,
+  verifyRoomToken,
+  parseCookies
+} = require('./src/auth');
 const { LANGUAGES, DEFAULT_TEMPLATES, PROBLEM_PRESETS, getPresetById } = require('./src/presets');
 const { executeCode, CONTAINER_RUNTIME, SANDBOX_IMAGE } = require('./src/runner');
 const { getVSCodeSession, destroyVSCodeSession } = require('./src/vscode');
@@ -45,7 +56,8 @@ const INTERVIEWER_ONLY_ACTIONS = new Set([
   'title_change',
   'reset_template',
   'timer_action',
-  'role_change'
+  'role_change',
+  'password_change'
 ]);
 
 // Active rooms in memory: roomId -> { data, clients: Map<ws, clientInfo>, saveTimer, isRunning, timer }
@@ -186,6 +198,88 @@ function sendJson(res, status, data) {
   res.end(body);
 }
 
+// ---- Room password / unlock helpers ----
+
+function getClientIp(req) {
+  const cf = req.headers['cf-connecting-ip'];
+  if (cf) return String(cf).split(',')[0].trim();
+  const forwarded = req.headers['x-forwarded-for'];
+  if (forwarded) return String(forwarded).split(',')[0].trim();
+  return req.socket.remoteAddress || 'unknown';
+}
+
+function isSecureRequest(req) {
+  return Boolean(req.socket.encrypted) || req.headers['x-forwarded-proto'] === 'https';
+}
+
+function isRoomProtected(roomId) {
+  return Boolean(getRoomPasswordHash(roomId));
+}
+
+function isRequestAuthorized(req, roomId) {
+  const passwordHash = getRoomPasswordHash(roomId);
+  if (!passwordHash) return true;
+
+  const cookies = parseCookies(req.headers.cookie || '');
+  const token = cookies[roomCookieName(roomId)];
+  return verifyRoomToken(roomId, token, passwordHash, getSessionSecret());
+}
+
+function appendRoomUnlockCookie(res, req, roomId, passwordHash) {
+  const token = signRoomToken(roomId, passwordHash, getSessionSecret());
+  const parts = [
+    `${roomCookieName(roomId)}=${token}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    `Max-Age=${Math.floor(ROOM_SESSION_TTL_MS / 1000)}`
+  ];
+  if (isSecureRequest(req)) parts.push('Secure');
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+// Basic brute-force protection for room unlock attempts.
+const UNLOCK_WINDOW_MS = 15 * 60 * 1000;
+const UNLOCK_MAX_ATTEMPTS = 10;
+const unlockAttempts = new Map();
+
+function unlockAttemptKey(req, roomId) {
+  return `${roomId}:${getClientIp(req)}`;
+}
+
+function isUnlockRateLimited(req, roomId) {
+  const key = unlockAttemptKey(req, roomId);
+  const now = Date.now();
+  const record = unlockAttempts.get(key);
+  if (!record || now - record.firstAt > UNLOCK_WINDOW_MS) {
+    unlockAttempts.set(key, { count: 0, firstAt: now });
+    return false;
+  }
+  return record.count >= UNLOCK_MAX_ATTEMPTS;
+}
+
+function recordUnlockFailure(req, roomId) {
+  const key = unlockAttemptKey(req, roomId);
+  const now = Date.now();
+  const record = unlockAttempts.get(key);
+  if (!record || now - record.firstAt > UNLOCK_WINDOW_MS) {
+    unlockAttempts.set(key, { count: 1, firstAt: now });
+    return;
+  }
+  record.count += 1;
+
+  // Keep the map from growing without bound.
+  if (unlockAttempts.size > 5000) {
+    for (const [k, v] of unlockAttempts) {
+      if (now - v.firstAt > UNLOCK_WINDOW_MS) unlockAttempts.delete(k);
+    }
+  }
+}
+
+function clearUnlockFailures(req, roomId) {
+  unlockAttempts.delete(unlockAttemptKey(req, roomId));
+}
+
 function serveStaticFile(res, filePath, contentType) {
   fs.readFile(filePath, (err, content) => {
     if (err) {
@@ -231,6 +325,11 @@ const server = http.createServer(async (req, res) => {
     // Per-room VS Code server reverse proxy
     const vsMatch = pathname.match(VSROOM_PATH_RE);
     if (vsMatch) {
+      if (!isRequestAuthorized(req, vsMatch[1])) {
+        res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end('This room is password protected. Open the room link and enter the password first.');
+        return;
+      }
       try {
         const session = getVSCodeSession(vsMatch[1]);
         const port = await session.ensure();
@@ -280,14 +379,75 @@ const server = http.createServer(async (req, res) => {
     // Create a room
     if (req.method === 'POST' && pathname === '/api/rooms') {
       const body = await readJsonBody(req);
+      const password = typeof body.password === 'string' ? body.password : '';
+      if (password.length > 256) {
+        return sendJson(res, 400, { error: 'Password must be 256 characters or fewer.' });
+      }
+
+      // Never return an existing room's contents from a create request; that
+      // would bypass the password gate for protected rooms.
+      const customId = String(body.customId || '').trim().replace(/[^a-zA-Z0-9_-]/g, '');
+      if (customId && getRoom(customId)) {
+        return sendJson(res, 409, { error: 'That room ID is already in use.' });
+      }
+
       const room = createRoom({
-        id: body.customId,
+        id: customId,
         title: body.title,
         language: body.language || 'python',
         layout: body.layout || 'legacy',
-        presetId: body.presetId || 'blank'
+        presetId: body.presetId || 'blank',
+        password
       });
+
+      // Let the creator enter immediately instead of asking for the password
+      // they just chose.
+      if (password && room) {
+        appendRoomUnlockCookie(res, req, room.id, getRoomPasswordHash(room.id));
+      }
       return sendJson(res, 201, { room });
+    }
+
+    // Room access state (used by the unlock page)
+    const roomAccessMatch = pathname.match(/^\/api\/rooms\/([a-zA-Z0-9_-]+)\/access$/);
+    if (req.method === 'GET' && roomAccessMatch) {
+      const roomId = roomAccessMatch[1];
+      const room = getRoom(roomId);
+      if (!room) return sendJson(res, 404, { error: 'Room not found.' });
+
+      const locked = isRoomProtected(roomId);
+      return sendJson(res, 200, {
+        locked,
+        authorized: !locked || isRequestAuthorized(req, roomId),
+        title: room.title
+      });
+    }
+
+    // Unlock a password-protected room
+    const roomUnlockMatch = pathname.match(/^\/api\/rooms\/([a-zA-Z0-9_-]+)\/unlock$/);
+    if (req.method === 'POST' && roomUnlockMatch) {
+      const roomId = roomUnlockMatch[1];
+      const passwordHash = getRoomPasswordHash(roomId);
+      if (!passwordHash) {
+        return sendJson(res, 200, { ok: true, locked: false });
+      }
+
+      if (isUnlockRateLimited(req, roomId)) {
+        return sendJson(res, 429, {
+          error: 'Too many incorrect password attempts. Please try again later.'
+        });
+      }
+
+      const body = await readJsonBody(req);
+      const password = typeof body.password === 'string' ? body.password : '';
+      if (!password || password.length > 256 || !verifyPassword(password, passwordHash)) {
+        recordUnlockFailure(req, roomId);
+        return sendJson(res, 401, { error: 'Incorrect password.' });
+      }
+
+      clearUnlockFailures(req, roomId);
+      appendRoomUnlockCookie(res, req, roomId, passwordHash);
+      return sendJson(res, 200, { ok: true, locked: true });
     }
 
     // Get or delete a specific room
@@ -295,6 +455,9 @@ const server = http.createServer(async (req, res) => {
     if (roomApiMatch) {
       const roomId = roomApiMatch[1];
       if (req.method === 'GET') {
+        if (!isRequestAuthorized(req, roomId)) {
+          return sendJson(res, 401, { error: 'Password required.', locked: true });
+        }
         const entry = getActiveRoom(roomId);
         return sendJson(res, 200, {
           room: entry.data,
@@ -303,6 +466,9 @@ const server = http.createServer(async (req, res) => {
         });
       }
       if (req.method === 'DELETE') {
+        if (!isRequestAuthorized(req, roomId)) {
+          return sendJson(res, 401, { error: 'Password required.', locked: true });
+        }
         const entry = activeRooms.get(roomId);
         if (entry) {
           if (entry.saveTimer) clearTimeout(entry.saveTimer);
@@ -317,7 +483,11 @@ const server = http.createServer(async (req, res) => {
     // Room page route: /room/:id
     const roomPageMatch = pathname.match(/^\/room\/([a-zA-Z0-9_-]+)\/?$/);
     if (req.method === 'GET' && roomPageMatch) {
-      const room = getRoom(roomPageMatch[1]);
+      const roomId = roomPageMatch[1];
+      if (isRoomProtected(roomId) && !isRequestAuthorized(req, roomId)) {
+        return serveStaticFile(res, path.join(PUBLIC_DIR, 'unlock.html'), MIME_TYPES['.html']);
+      }
+      const room = getRoom(roomId);
       const html = room && room.layout === 'vscode-server' ? 'vsroom.html' : 'room.html';
       return serveStaticFile(res, path.join(PUBLIC_DIR, html), MIME_TYPES['.html']);
     }
@@ -358,6 +528,11 @@ wss.on('connection', (ws, req) => {
 
   if (!roomId) {
     ws.close(1008, 'Missing roomId');
+    return;
+  }
+
+  if (!isRequestAuthorized(req, roomId)) {
+    ws.close(1008, 'Password required');
     return;
   }
 
@@ -592,6 +767,26 @@ wss.on('connection', (ws, req) => {
         break;
       }
 
+      case 'password_change': {
+        const password = typeof msg.password === 'string' ? msg.password : '';
+        if (password.length > 256) {
+          sendTo(ws, {
+            type: 'permission_denied',
+            action: 'password_change',
+            message: 'Password must be 256 characters or fewer.'
+          });
+          break;
+        }
+        setRoomPassword(roomId, password);
+        entry.data.isProtected = Boolean(password);
+        broadcast(entry, {
+          type: 'password_updated',
+          isProtected: entry.data.isProtected,
+          byName: clientInfo.name
+        });
+        break;
+      }
+
       case 'reset_template': {
         const lang = entry.data.language;
         const defaultCode = DEFAULT_TEMPLATES[lang] || '';
@@ -740,6 +935,10 @@ server.on('upgrade', (req, socket, head) => {
 
   const vsMatch = pathname.match(VSROOM_PATH_RE);
   if (vsMatch) {
+    if (!isRequestAuthorized(req, vsMatch[1])) {
+      socket.destroy();
+      return;
+    }
     getVSCodeSession(vsMatch[1])
       .ensure()
       .then((port) => {

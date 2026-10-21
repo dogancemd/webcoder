@@ -59,6 +59,7 @@
   const usersCount = $('usersCount');
   const usersDropdown = $('usersDropdown');
   const inviteBtn = $('inviteBtn');
+  const roomLockBtn = $('roomLockBtn');
 
   const promptPane = $('promptPane');
   const resizerLeft = $('resizerLeft');
@@ -96,6 +97,8 @@
   let fallbackTextarea = null;
   let suppressEditorChange = false;
   let isRunning = false;
+  let roomIsProtected = false;
+  let pendingPasswordCookie = null;
 
   let timerState = { running: false, elapsedMs: 0, syncedAt: Date.now() };
 
@@ -283,6 +286,19 @@
     selfRoleBadge.textContent = selfRole === 'interviewer' ? 'Interviewer' : 'Interviewee';
   }
 
+  function updateLockButton() {
+    if (!roomLockBtn) return;
+    if (selfRole !== 'interviewer') {
+      roomLockBtn.style.display = 'none';
+      return;
+    }
+    roomLockBtn.style.display = '';
+    roomLockBtn.textContent = roomIsProtected ? '🔒 Protected' : '🔓 Set Password';
+    roomLockBtn.title = roomIsProtected
+      ? 'Change or remove the room password'
+      : 'Protect this room with a password';
+  }
+
   function applyRolePermissions() {
     const isInt = selfRole === 'interviewer';
     promptEditTab.style.display = isInt ? '' : 'none';
@@ -316,6 +332,7 @@
     } else {
       roleNotice.style.display = 'none';
     }
+    updateLockButton();
     renderParticipants();
   }
 
@@ -451,6 +468,7 @@
           const room = msg.room;
           document.title = `${room.title} — WebCoder`;
           roomTitleInput.value = room.title;
+          roomIsProtected = Boolean(room.isProtected);
           currentLanguage = room.language || 'python';
           codes = room.codes || codes;
           languageSelect.value = currentLanguage;
@@ -505,6 +523,7 @@
         }
 
         case 'permission_denied':
+          pendingPasswordCookie = null;
           showToast(msg.message || 'Only the interviewer can perform this action.');
           break;
 
@@ -537,6 +556,27 @@
           document.title = `${msg.title} — WebCoder`;
           break;
 
+        case 'password_updated': {
+          roomIsProtected = Boolean(msg.isProtected);
+          updateLockButton();
+          showToast(msg.isProtected
+            ? 'This room is now password protected.'
+            : 'Room password removed.');
+
+          // The setter's old cookie is now invalid; refresh it with the new
+          // password so a reload doesn't lock them out.
+          if (pendingPasswordCookie) {
+            const password = pendingPasswordCookie;
+            pendingPasswordCookie = null;
+            fetch(`/api/rooms/${encodeURIComponent(roomId)}/unlock`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ password })
+            }).catch(() => {});
+          }
+          break;
+        }
+
         case 'preset_loaded':
           updatePromptUI(msg.promptMarkdown, true);
           if (msg.replaceCode && msg.codes) {
@@ -558,7 +598,14 @@
       }
     });
 
-    ws.addEventListener('close', () => {
+    ws.addEventListener('close', (event) => {
+      if (event.code === 1008 && /password/i.test(event.reason || '')) {
+        syncIndicator.textContent = '● Password required';
+        syncIndicator.style.color = '#d29922';
+        showToast('Room password required. Reloading...');
+        setTimeout(() => window.location.reload(), 1200);
+        return;
+      }
       syncIndicator.textContent = '● Reconnecting...';
       syncIndicator.style.color = '#d29922';
       setTimeout(connectWebSocket, 1500);
@@ -606,6 +653,26 @@
     try { await navigator.clipboard.writeText(url); showToast('Room invite link copied to clipboard!'); }
     catch { prompt('Copy room invite link:', url); }
   });
+
+  if (roomLockBtn) {
+    roomLockBtn.addEventListener('click', () => {
+      if (selfRole !== 'interviewer') return;
+
+      const promptText = roomIsProtected
+        ? 'Enter a new room password (leave blank to remove protection):'
+        : 'Enter a password to protect this room:';
+      const nextPassword = prompt(promptText, '');
+      if (nextPassword === null) return;
+      if (nextPassword.length > 256) {
+        showToast('Password must be 256 characters or fewer.');
+        return;
+      }
+      if (!roomIsProtected && !nextPassword) return;
+
+      pendingPasswordCookie = nextPassword || null;
+      sendWs({ type: 'password_change', password: nextPassword });
+    });
+  }
 
   usersBtn.addEventListener('click', (e) => { e.stopPropagation(); usersMenu.classList.toggle('open'); });
   document.addEventListener('click', (e) => { if (!usersMenu.contains(e.target)) usersMenu.classList.remove('open'); });

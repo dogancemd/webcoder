@@ -3,6 +3,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { getPresetById, LANGUAGES } = require('./presets');
+const { hashPassword } = require('./auth');
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
 if (!fs.existsSync(DATA_DIR)) {
@@ -21,6 +22,7 @@ db.exec(`
     title TEXT NOT NULL,
     language TEXT NOT NULL DEFAULT 'python',
     layout TEXT NOT NULL DEFAULT 'legacy',
+    password_hash TEXT NOT NULL DEFAULT '',
     code_python TEXT NOT NULL,
     code_cpp TEXT NOT NULL,
     code_java TEXT NOT NULL,
@@ -42,11 +44,16 @@ db.exec(`
     color TEXT NOT NULL DEFAULT '#38bdf8',
     PRIMARY KEY (room_id, identity_id)
   );
+
+  CREATE TABLE IF NOT EXISTS app_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
 `);
 
 // Migration: add language/layout columns to databases created before later versions
 const existingCols = db.prepare('PRAGMA table_info(rooms)').all().map((c) => c.name);
-for (const col of ['code_rust', 'code_go', 'code_javascript', 'layout']) {
+for (const col of ['code_rust', 'code_go', 'code_javascript', 'layout', 'password_hash']) {
   if (!existingCols.includes(col)) {
     db.exec(`ALTER TABLE rooms ADD COLUMN ${col} TEXT NOT NULL DEFAULT ''`);
   }
@@ -59,9 +66,9 @@ const stmts = {
   getRoom: db.prepare('SELECT * FROM rooms WHERE id = ?'),
   insertRoom: db.prepare(`
     INSERT INTO rooms (
-      id, title, language, layout, code_python, code_cpp, code_java, code_rust, code_go, code_javascript,
+      id, title, language, layout, password_hash, code_python, code_cpp, code_java, code_rust, code_go, code_javascript,
       prompt_markdown, stdin, last_output_json, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `),
   updateRoom: db.prepare(`
     UPDATE rooms
@@ -80,13 +87,19 @@ const stmts = {
     WHERE id = ?
   `),
   listRecentRooms: db.prepare(`
-    SELECT id, title, language, created_at, updated_at
+    SELECT id, title, language, created_at, updated_at, (password_hash != '') AS is_protected
     FROM rooms
     ORDER BY updated_at DESC
     LIMIT ?
   `),
   deleteRoom: db.prepare('DELETE FROM rooms WHERE id = ?'),
   deleteRoomRoles: db.prepare('DELETE FROM room_roles WHERE room_id = ?'),
+
+  getRoomPasswordHash: db.prepare('SELECT password_hash FROM rooms WHERE id = ?'),
+  setRoomPassword: db.prepare('UPDATE rooms SET password_hash = ? WHERE id = ?'),
+
+  getMeta: db.prepare('SELECT value FROM app_meta WHERE key = ?'),
+  setMeta: db.prepare('INSERT INTO app_meta (key, value) VALUES (?, ?)'),
 
   getRole: db.prepare(
     'SELECT role, name, color FROM room_roles WHERE room_id = ? AND identity_id = ?'
@@ -132,6 +145,7 @@ function hydrateRoomRow(row) {
     title: row.title,
     language: row.language,
     layout: row.layout === 'vscode-server' ? 'vscode-server' : 'legacy',
+    isProtected: Boolean(row.password_hash),
     codes: {
       python: row.code_python,
       cpp: row.code_cpp,
@@ -148,7 +162,7 @@ function hydrateRoomRow(row) {
   };
 }
 
-function createRoom({ id, title, language = 'python', layout = 'legacy', presetId = 'blank' } = {}) {
+function createRoom({ id, title, language = 'python', layout = 'legacy', presetId = 'blank', password = '' } = {}) {
   const roomId = (id && String(id).trim().replace(/[^a-zA-Z0-9_-]/g, '')) || generateRoomId();
   const existing = getRoom(roomId);
   if (existing) return existing;
@@ -157,6 +171,7 @@ function createRoom({ id, title, language = 'python', layout = 'legacy', presetI
   const validLang = LANGUAGES.includes(language) ? language : 'python';
   const validLayout = layout === 'vscode-server' ? 'vscode-server' : 'legacy';
   const roomTitle = (title && String(title).trim()) || `${preset.title} Interview`;
+  const passwordHash = password ? hashPassword(String(password)) : '';
   const now = Date.now();
 
   stmts.insertRoom.run(
@@ -164,6 +179,7 @@ function createRoom({ id, title, language = 'python', layout = 'legacy', presetI
     roomTitle,
     validLang,
     validLayout,
+    passwordHash,
     preset.templates.python,
     preset.templates.cpp,
     preset.templates.java,
@@ -219,9 +235,40 @@ function listRecentRooms(limit = 20) {
     id: r.id,
     title: r.title,
     language: r.language,
+    isProtected: Boolean(r.is_protected),
     createdAt: r.created_at,
     updatedAt: r.updated_at
   }));
+}
+
+// ---- Room password management ----
+
+function getRoomPasswordHash(roomId) {
+  const row = stmts.getRoomPasswordHash.get(roomId);
+  return (row && row.password_hash) || '';
+}
+
+function setRoomPassword(roomId, password) {
+  const passwordHash = password ? hashPassword(String(password)) : '';
+  stmts.setRoomPassword.run(passwordHash, roomId);
+  return passwordHash;
+}
+
+// Stable server-side secret used to sign room unlock cookies. Persisted in the
+// database so unlocks survive server restarts.
+let cachedSessionSecret = null;
+function getSessionSecret() {
+  if (cachedSessionSecret) return cachedSessionSecret;
+
+  const row = stmts.getMeta.get('session_secret');
+  if (row && row.value) {
+    cachedSessionSecret = row.value;
+    return cachedSessionSecret;
+  }
+
+  cachedSessionSecret = crypto.randomBytes(32).toString('hex');
+  stmts.setMeta.run('session_secret', cachedSessionSecret);
+  return cachedSessionSecret;
 }
 
 // ---- Role management (sticky across reconnects & restarts) ----
@@ -260,6 +307,9 @@ module.exports = {
   saveRoomState,
   listRecentRooms,
   deleteRoom,
+  getRoomPasswordHash,
+  setRoomPassword,
+  getSessionSecret,
   getRole,
   setRole,
   listRoles,

@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>Password Required — WebCoder</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="lobby-wrapper" style="max-width: 460px; justify-content: center;">
+    <header class="lobby-header" style="margin-bottom: 24px;">
+      <a href="/" class="brand">
+        <div class="brand-icon">&lt;/&gt;</div>
+        <div class="brand-text">
+          <h1>WebCoder</h1>
+          <p>Collaborative Interview Pad</p>
+        </div>
+      </a>
+    </header>
+
+    <div class="card">
+      <h2 class="card-title">🔒 Password Required</h2>
+      <p class="card-subtitle" id="unlockSubtitle">This interview room is password protected. Enter the password to continue.</p>
+
+      <form id="unlockForm">
+        <div class="form-group">
+          <label for="passwordInput">Room Password</label>
+          <input
+            type="password"
+            id="passwordInput"
+            class="input"
+            placeholder="Enter room password"
+            autocomplete="current-password"
+            maxlength="256"
+            required
+            autofocus
+          />
+        </div>
+
+        <div id="unlockError" style="display: none; color: var(--accent-red); font-size: 13px; margin-bottom: 14px;"></div>
+
+        <button type="submit" class="btn btn-primary" id="unlockBtn">
+          Unlock Room →
+        </button>
+      </form>
+
+      <p style="margin-top: 18px; font-size: 12.5px; color: var(--text-secondary); text-align: center;">
+        <a href="/" style="color: var(--accent-blue); text-decoration: none;">← Back to lobby</a>
+      </p>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script>
+    (() => {
+      const pathParts = window.location.pathname.split('/').filter(Boolean);
+      const roomId = pathParts[1] || '';
+      const target = `/room/${encodeURIComponent(roomId)}${window.location.search}`;
+      const form = document.getElementById('unlockForm');
+      const passwordInput = document.getElementById('passwordInput');
+      const unlockBtn = document.getElementById('unlockBtn');
+      const errorEl = document.getElementById('unlockError');
+      const subtitle = document.getElementById('unlockSubtitle');
+      const toastEl = document.getElementById('toast');
+
+      function showToast(msg) {
+        toastEl.textContent = msg;
+        toastEl.classList.add('show');
+        setTimeout(() => toastEl.classList.remove('show'), 2500);
+      }
+
+      function showError(msg) {
+        errorEl.textContent = msg;
+        errorEl.style.display = msg ? '' : 'none';
+      }
+
+      if (!roomId) {
+        window.location.replace('/');
+        return;
+      }
+
+      fetch(`/api/rooms/${encodeURIComponent(roomId)}/access`)
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          if (!data) return;
+          if (!data.locked || data.authorized) {
+            window.location.replace(target);
+            return;
+          }
+          if (data.title) {
+            subtitle.textContent = `Enter the password to join “${data.title}”.`;
+          }
+          passwordInput.focus();
+        })
+        .catch(() => {});
+
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        showError('');
+
+        const password = passwordInput.value;
+        if (!password) {
+          showError('Please enter the room password.');
+          return;
+        }
+
+        unlockBtn.disabled = true;
+        const originalLabel = unlockBtn.textContent;
+        unlockBtn.textContent = 'Unlocking...';
+
+        try {
+          const res = await fetch(`/api/rooms/${encodeURIComponent(roomId)}/unlock`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password })
+          });
+          const data = await res.json().catch(() => ({}));
+
+          if (res.ok && data.ok) {
+            showToast('Room unlocked.');
+            window.location.replace(target);
+            return;
+          }
+
+          if (res.status === 429) {
+            showError(data.error || 'Too many attempts. Please try again later.');
+          } else {
+            showError(data.error || 'Incorrect password.');
+            passwordInput.select();
+          }
+        } catch {
+          showError('Could not unlock the room. Please try again.');
+        } finally {
+          unlockBtn.disabled = false;
+          unlockBtn.textContent = originalLabel;
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -75,6 +75,11 @@
             <input type="text" id="customIdInput" class="input" placeholder="Leave blank for random slug" pattern="[a-zA-Z0-9_-]+" maxlength="40" />
           </div>
 
+          <div class="form-group">
+            <label for="roomPasswordInput">Room Password (Optional)</label>
+            <input type="password" id="roomPasswordInput" class="input" placeholder="Leave blank for no password" maxlength="256" autocomplete="new-password" />
+          </div>
+
           <button type="submit" class="btn btn-primary" id="createBtn">
             Create &amp; Enter Room →
           </button>
@@ -107,6 +112,7 @@
     const presetSelect = document.getElementById('presetSelect');
     const layoutSelect = document.getElementById('layoutSelect');
     const customIdInput = document.getElementById('customIdInput');
+    const roomPasswordInput = document.getElementById('roomPasswordInput');
     const createRoomForm = document.getElementById('createRoomForm');
     const roomsList = document.getElementById('roomsList');
     const refreshRoomsBtn = document.getElementById('refreshRoomsBtn');
@@ -173,12 +179,16 @@
           const liveBadge = r.activeParticipants > 0
             ? `<span class="live-pill">● ${r.activeParticipants} online</span>`
             : '';
+          const lockBadge = r.isProtected
+            ? `<span class="lock-pill" title="Password protected">🔒 Locked</span>`
+            : '';
           return `
             <div class="room-item">
               <div class="room-item-info">
                 <a href="/room/${encodeURIComponent(r.id)}" class="room-item-title">
                   <span>${escapeHtml(r.title)}</span>
                   <span class="lang-tag lang-${escapeHtml(r.language)}">${langLabel}</span>
+                  ${lockBadge}
                   ${liveBadge}
                 </a>
                 <div class="room-item-meta">
@@ -213,7 +223,31 @@
 
     window.deleteRoomById = async (id) => {
       if (!confirm(`Delete interview room "${id}"?`)) return;
-      await fetch(`/api/rooms/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      const url = `/api/rooms/${encodeURIComponent(id)}`;
+      let res = await fetch(url, { method: 'DELETE' });
+
+      if (res.status === 401) {
+        const info = await res.json().catch(() => ({}));
+        if (info.locked) {
+          const password = prompt('This room is password protected. Enter its password to delete it:');
+          if (password === null) return;
+          const unlockRes = await fetch(`${url}/unlock`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password })
+          });
+          if (!unlockRes.ok) {
+            showToast('Incorrect password. Room was not deleted.');
+            return;
+          }
+          res = await fetch(url, { method: 'DELETE' });
+        }
+      }
+
+      if (!res.ok) {
+        showToast('Could not delete room.');
+        return;
+      }
       showToast('Room deleted');
       loadRooms();
     };
@@ -230,7 +264,8 @@
         language: languageSelect.value,
         layout: layoutSelect.value,
         presetId: presetSelect.value,
-        customId: customIdInput.value.trim()
+        customId: customIdInput.value.trim(),
+        password: roomPasswordInput.value
       };
 
       const res = await fetch('/api/rooms', {
@@ -249,6 +284,8 @@
           }));
         } catch {}
         window.location.href = `/room/${encodeURIComponent(data.room.id)}`;
+      } else {
+        showToast(data.error || 'Could not create room.');
       }
     });
 
