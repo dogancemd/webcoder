@@ -65,6 +65,25 @@ function verifyRoomToken(roomId, token, passwordHash, secret) {
   return givenBuf.length === expectedBuf.length && crypto.timingSafeEqual(givenBuf, expectedBuf);
 }
 
+// Invite links are bearer tokens tied to the room's current password. They
+// remain valid until the password is changed.
+function signInviteToken(roomId, passwordHash, secret) {
+  const payload = `invite.${roomId}.${passwordFingerprint(passwordHash)}`;
+  return crypto.createHmac('sha256', secret).update(payload).digest('hex');
+}
+
+function verifyInviteToken(roomId, token, passwordHash, secret) {
+  if (!token || !passwordHash || !secret) return false;
+
+  const expected = signInviteToken(roomId, passwordHash, secret);
+  const given = String(token);
+  if (!/^[0-9a-f]+$/i.test(given) || given.length !== expected.length) return false;
+
+  const givenBuf = Buffer.from(given, 'hex');
+  const expectedBuf = Buffer.from(expected, 'hex');
+  return givenBuf.length === expectedBuf.length && crypto.timingSafeEqual(givenBuf, expectedBuf);
+}
+
 function parseCookies(header) {
   const cookies = {};
   if (!header) return cookies;
@@ -91,5 +110,7 @@ module.exports = {
   roomCookieName,
   signRoomToken,
   verifyRoomToken,
+  signInviteToken,
+  verifyInviteToken,
   parseCookies
 };

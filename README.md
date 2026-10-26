@@ -12,8 +12,8 @@ The project aims to make technical interviews easy to host on your own infrastru
 
 - **Live collaboration:** shared code, participant cursors and selections, custom stdin, and program output in the classic editor. Each language keeps its own code buffer.
 - **Interview tools:** a Markdown problem statement with preview, a shared stopwatch, and built-in exercises including Two Sum, LRU Cache, Merge Intervals, and Number of Islands. New rooms default to a blank/custom prompt with starter code.
-- **Interviewer controls:** manage the prompt, load presets, rename the room, reset starter code, control the timer, and promote or demote participants. Everyone can edit and run code.
-- **Optional room passwords:** protect room pages, live state, API data, and the VS Code workspace. Browser unlocks last 24 hours; changing the password invalidates existing unlocks.
+- **Optional room passwords:** protect room pages, live state, API data, and the VS Code workspace. Browser unlocks last 24 hours; changing the password invalidates existing unlocks and invite links. **Copy Invite Link** embeds a signed token so invitees join without typing the password.
+- **Interviewer controls:** manage the prompt, load presets, rename the room, reset starter code, control the timer, and promote or demote participants. Everyone can edit and run code. If no interviewer is currently present, any participant can use **Become Interviewer** to take over.
 - **Persistent rooms:** SQLite stores room content and browser-linked participant roles across server restarts. VS Code files live in a persistent container volume.
 - **Container-based execution:** classic-editor runs use temporary containers with resource limits and no network access.
 
@@ -75,10 +75,10 @@ npm run build:vscode
 
 1. Create a room from the lobby and choose a language, problem preset, and editor layout.
 2. Add a room password if desired.
-3. Enter the room and share its URL with the other participant.
+3. Enter the room and share its URL with the other participant. Use **Copy Invite Link** to generate a link that unlocks the room automatically.
 4. In the classic editor, edit code together, supply custom input, and run it to see shared results.
 
-The first participant to enter a room becomes the interviewer. Roles are associated with an identity stored in that browser's `localStorage` and persisted in SQLite; using a different browser or clearing browser storage creates a different identity.
+The first participant to enter a room becomes the interviewer. Roles are associated with an identity stored in that browser's `localStorage` and persisted in SQLite; using a different browser or clearing browser storage creates a different identity. If the interviewer has left, an interviewee can claim the role with **Become Interviewer**.
 
 ## Configuration
 

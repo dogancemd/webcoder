@@ -60,6 +60,7 @@
   const usersDropdown = $('usersDropdown');
   const inviteBtn = $('inviteBtn');
   const roomLockBtn = $('roomLockBtn');
+  const claimInterviewerBtn = $('claimInterviewerBtn');
 
   const promptPane = $('promptPane');
   const resizerLeft = $('resizerLeft');
@@ -299,6 +300,13 @@
       : 'Protect this room with a password';
   }
 
+  function updateClaimButton() {
+    if (!claimInterviewerBtn) return;
+    const hasInterviewer = participants.some((p) => p.role === 'interviewer');
+    const canClaim = Boolean(selfRole) && selfRole !== 'interviewer' && !hasInterviewer;
+    claimInterviewerBtn.style.display = canClaim ? '' : 'none';
+  }
+
   function applyRolePermissions() {
     const isInt = selfRole === 'interviewer';
     promptEditTab.style.display = isInt ? '' : 'none';
@@ -333,6 +341,7 @@
       roleNotice.style.display = 'none';
     }
     updateLockButton();
+    updateClaimButton();
     renderParticipants();
   }
 
@@ -505,6 +514,7 @@
           const activeIds = new Set(participants.map((p) => p.id));
           for (const uid of remoteCursors.keys()) if (!activeIds.has(uid)) remoteCursors.delete(uid);
           for (const p of participants) if (p.id !== selfId && p.cursor) remoteCursors.set(p.id, { name: p.name, color: p.color, cursor: p.cursor });
+          updateClaimButton();
           renderParticipants();
           renderRemoteCursors();
           break;
@@ -515,15 +525,20 @@
             selfRole = msg.role;
             updateRoleBadge();
             applyRolePermissions();
-            showToast(`${msg.byName} made you the ${msg.role}.`);
+            showToast(msg.claimed ? 'You are now the interviewer.' : `${msg.byName} made you the ${msg.role}.`);
           } else {
-            showToast(`${msg.byName} made ${msg.name} the ${msg.role}.`);
+            showToast(msg.claimed
+              ? `${msg.name} became the interviewer.`
+              : `${msg.byName} made ${msg.name} the ${msg.role}.`);
           }
           break;
         }
 
         case 'permission_denied':
           pendingPasswordCookie = null;
+          if (msg.action === 'claim_interviewer' && claimInterviewerBtn) {
+            claimInterviewerBtn.style.display = 'none';
+          }
           showToast(msg.message || 'Only the interviewer can perform this action.');
           break;
 
@@ -649,10 +664,29 @@
   });
 
   inviteBtn.addEventListener('click', async () => {
-    const url = window.location.href;
-    try { await navigator.clipboard.writeText(url); showToast('Room invite link copied to clipboard!'); }
-    catch { prompt('Copy room invite link:', url); }
+    const baseUrl = `${window.location.origin}/room/${encodeURIComponent(roomId)}`;
+    let url = baseUrl;
+    try {
+      const res = await fetch(`/api/rooms/${encodeURIComponent(roomId)}/invite`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.token) url = `${baseUrl}?invite=${encodeURIComponent(data.token)}`;
+      }
+    } catch {}
+    try {
+      await navigator.clipboard.writeText(url);
+      showToast(url.includes('?invite=') ? 'Password-free invite link copied!' : 'Room invite link copied to clipboard!');
+    } catch {
+      prompt('Copy room invite link:', url);
+    }
   });
+
+  if (claimInterviewerBtn) {
+    claimInterviewerBtn.addEventListener('click', () => {
+      if (selfRole === 'interviewer') return;
+      sendWs({ type: 'claim_interviewer' });
+    });
+  }
 
   if (roomLockBtn) {
     roomLockBtn.addEventListener('click', () => {

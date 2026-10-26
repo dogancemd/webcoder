@@ -79,9 +79,21 @@
       });
 
       inviteBtn.addEventListener('click', async () => {
-        const url = `${window.location.origin}/room/${roomId}`;
-        try { await navigator.clipboard.writeText(url); showToast('Room invite link copied!'); }
-        catch { prompt('Copy room invite link:', url); }
+        const baseUrl = `${window.location.origin}/room/${encodeURIComponent(roomId)}`;
+        let url = baseUrl;
+        try {
+          const res = await fetch(`/api/rooms/${encodeURIComponent(roomId)}/invite`);
+          if (res.ok) {
+            const data = await res.json();
+            if (data.token) url = `${baseUrl}?invite=${encodeURIComponent(data.token)}`;
+          }
+        } catch {}
+        try {
+          await navigator.clipboard.writeText(url);
+          showToast(url.includes('?invite=') ? 'Password-free invite link copied!' : 'Room invite link copied!');
+        } catch {
+          prompt('Copy room invite link:', url);
+        }
       });
 
       reloadBtn.addEventListener('click', () => {

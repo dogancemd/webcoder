@@ -212,10 +212,18 @@
     }
 
     window.copyRoomLink = async (id) => {
-      const url = `${window.location.origin}/room/${id}`;
+      const baseUrl = `${window.location.origin}/room/${encodeURIComponent(id)}`;
+      let url = baseUrl;
+      try {
+        const res = await fetch(`/api/rooms/${encodeURIComponent(id)}/invite`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.token) url = `${baseUrl}?invite=${encodeURIComponent(data.token)}`;
+        }
+      } catch {}
       try {
         await navigator.clipboard.writeText(url);
-        showToast('Invite link copied to clipboard!');
+        showToast(url.includes('?invite=') ? 'Password-free invite link copied!' : 'Invite link copied to clipboard!');
       } catch {
         prompt('Copy room link:', url);
       }

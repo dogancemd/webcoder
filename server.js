@@ -25,6 +25,8 @@ const {
   roomCookieName,
   signRoomToken,
   verifyRoomToken,
+  signInviteToken,
+  verifyInviteToken,
   parseCookies
 } = require('./src/auth');
 const { LANGUAGES, DEFAULT_TEMPLATES, PROBLEM_PRESETS, getPresetById } = require('./src/presets');
@@ -238,6 +240,12 @@ function appendRoomUnlockCookie(res, req, roomId, passwordHash) {
   res.setHeader('Set-Cookie', parts.join('; '));
 }
 
+function isValidInviteToken(roomId, token) {
+  const passwordHash = getRoomPasswordHash(roomId);
+  if (!passwordHash) return false;
+  return verifyInviteToken(roomId, token, passwordHash, getSessionSecret());
+}
+
 // Basic brute-force protection for room unlock attempts.
 const UNLOCK_WINDOW_MS = 15 * 60 * 1000;
 const UNLOCK_MAX_ATTEMPTS = 10;
@@ -423,6 +431,22 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // Issue an invite token that lets the recipient skip the password prompt.
+    const roomInviteMatch = pathname.match(/^\/api\/rooms\/([a-zA-Z0-9_-]+)\/invite$/);
+    if (req.method === 'GET' && roomInviteMatch) {
+      const roomId = roomInviteMatch[1];
+      if (!isRequestAuthorized(req, roomId)) {
+        return sendJson(res, 401, { error: 'Password required.', locked: true });
+      }
+      if (!getRoom(roomId)) return sendJson(res, 404, { error: 'Room not found.' });
+
+      const passwordHash = getRoomPasswordHash(roomId);
+      const token = passwordHash
+        ? signInviteToken(roomId, passwordHash, getSessionSecret())
+        : null;
+      return sendJson(res, 200, { token });
+    }
+
     // Unlock a password-protected room
     const roomUnlockMatch = pathname.match(/^\/api\/rooms\/([a-zA-Z0-9_-]+)\/unlock$/);
     if (req.method === 'POST' && roomUnlockMatch) {
@@ -484,8 +508,21 @@ const server = http.createServer(async (req, res) => {
     const roomPageMatch = pathname.match(/^\/room\/([a-zA-Z0-9_-]+)\/?$/);
     if (req.method === 'GET' && roomPageMatch) {
       const roomId = roomPageMatch[1];
-      if (isRoomProtected(roomId) && !isRequestAuthorized(req, roomId)) {
-        return serveStaticFile(res, path.join(PUBLIC_DIR, 'unlock.html'), MIME_TYPES['.html']);
+      if (isRoomProtected(roomId)) {
+        const inviteToken = parsedUrl.searchParams.get('invite');
+        if (inviteToken && isValidInviteToken(roomId, inviteToken)) {
+          appendRoomUnlockCookie(res, req, roomId, getRoomPasswordHash(roomId));
+          res.writeHead(302, {
+            Location: `/room/${roomId}`,
+            'Cache-Control': 'no-store',
+            'Referrer-Policy': 'no-referrer'
+          });
+          res.end();
+          return;
+        }
+        if (!isRequestAuthorized(req, roomId)) {
+          return serveStaticFile(res, path.join(PUBLIC_DIR, 'unlock.html'), MIME_TYPES['.html']);
+        }
       }
       const room = getRoom(roomId);
       const html = room && room.layout === 'vscode-server' ? 'vsroom.html' : 'room.html';
@@ -659,6 +696,41 @@ wss.on('connection', (ws, req) => {
           role: newRole,
           name: target.name,
           byName: clientInfo.name
+        });
+        break;
+      }
+
+      case 'claim_interviewer': {
+        if (clientInfo.role === 'interviewer') break;
+
+        // Only allow a takeover while nobody currently in the room is an
+        // interviewer. The persisted role may still exist from someone who
+        // has left, which is exactly the recovery case this handles.
+        const hasActiveInterviewer = Array.from(entry.clients.values()).some(
+          (c) => c.role === 'interviewer'
+        );
+        if (hasActiveInterviewer) {
+          sendTo(ws, {
+            type: 'permission_denied',
+            action: 'claim_interviewer',
+            message: 'An interviewer is already present.'
+          });
+          break;
+        }
+
+        updateIdentity(entry, clientInfo.identityId, { role: 'interviewer' });
+        setRole(roomId, clientInfo.identityId, 'interviewer', clientInfo.name, clientInfo.color);
+        broadcast(entry, {
+          type: 'participants',
+          participants: getParticipantsList(entry)
+        });
+        broadcast(entry, {
+          type: 'role_updated',
+          identityId: clientInfo.identityId,
+          role: 'interviewer',
+          name: clientInfo.name,
+          byName: clientInfo.name,
+          claimed: true
         });
         break;
       }
