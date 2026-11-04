@@ -1,0 +1,17 @@
+[Unit]
+Description=WebCoder collaborative interview workspace
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECTS@/webcoder
+Environment=PORT=31311
+Environment=HOST=127.0.0.1
+Environment=PATH=/home/dcem/.local/bin:/usr/local/bin:/usr/bin
+ExecStart=/home/dcem/.local/bin/node server.js
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=default.target

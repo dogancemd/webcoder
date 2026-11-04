@@ -61,6 +61,14 @@
   const inviteBtn = $('inviteBtn');
   const roomLockBtn = $('roomLockBtn');
   const claimInterviewerBtn = $('claimInterviewerBtn');
+  const stageSelect = $('stageSelect');
+  const stageProgress = $('stageProgress');
+  const stageControls = $('stageControls');
+  const previousStageBtn = $('previousStageBtn');
+  const nextStageBtn = $('nextStageBtn');
+  const addStageBtn = $('addStageBtn');
+  const renameStageBtn = $('renameStageBtn');
+  const removeStageBtn = $('removeStageBtn');
 
   const promptPane = $('promptPane');
   const resizerLeft = $('resizerLeft');
@@ -72,6 +80,10 @@
   const roleNotice = $('roleNotice');
   const promptPreview = $('promptPreview');
   const promptEditor = $('promptEditor');
+  const promptBody = $('promptBody');
+  const promptImageTools = $('promptImageTools');
+  const uploadImageBtn = $('uploadImageBtn');
+  const promptImageInput = $('promptImageInput');
   const fileNameLabel = $('fileNameLabel');
   const syncIndicator = $('syncIndicator');
   const fontSizeSelect = $('fontSizeSelect');
@@ -100,6 +112,12 @@
   let isRunning = false;
   let roomIsProtected = false;
   let pendingPasswordCookie = null;
+  let stages = [];
+  let activeStageId = null;
+  const editorModels = new Map();
+  let codeDebounce = null;
+  let pendingCodeChange = null;
+  let imageUploading = false;
 
   let timerState = { running: false, elapsedMs: 0, syncedAt: Date.now() };
 
@@ -115,46 +133,98 @@
     return div.innerHTML;
   }
 
-  function renderMarkdown(md) {
-    const raw = String(md || '');
-    const lines = raw.split(/\r?\n/);
-    let html = '';
-    let inCodeBlock = false;
-    let codeBlockLines = [];
-    let inList = false;
-    const formatInline = (text) => {
-      let s = escapeHtml(text);
-      s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
-      s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-      s = s.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-      return s;
-    };
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if (line.trim().startsWith('```')) {
-        if (inList) { html += '</ul>'; inList = false; }
-        if (!inCodeBlock) { inCodeBlock = true; codeBlockLines = []; }
-        else { html += `<pre><code>${escapeHtml(codeBlockLines.join('\n'))}</code></pre>`; inCodeBlock = false; }
-        continue;
-      }
-      if (inCodeBlock) { codeBlockLines.push(line); continue; }
-      const trimmed = line.trim();
-      if (!trimmed) { if (inList) { html += '</ul>'; inList = false; } continue; }
-      if (/^---+$/.test(trimmed)) { if (inList) { html += '</ul>'; inList = false; } html += '<hr />'; continue; }
-      if (trimmed.startsWith('### ')) { if (inList) { html += '</ul>'; inList = false; } html += `<h3>${formatInline(trimmed.slice(4))}</h3>`; }
-      else if (trimmed.startsWith('## ')) { if (inList) { html += '</ul>'; inList = false; } html += `<h2>${formatInline(trimmed.slice(3))}</h2>`; }
-      else if (trimmed.startsWith('# ')) { if (inList) { html += '</ul>'; inList = false; } html += `<h1>${formatInline(trimmed.slice(2))}</h1>`; }
-      else if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) { if (!inList) { html += '<ul>'; inList = true; } html += `<li>${formatInline(trimmed.slice(2))}</li>`; }
-      else { if (inList) { html += '</ul>'; inList = false; } html += `<p>${formatInline(trimmed)}</p>`; }
+  const { renderMarkdown } = window.WebCoderMarkdown;
+
+  function updateImageControls() {
+    const isInterviewer = selfRole === 'interviewer';
+    promptImageTools.hidden = !isInterviewer;
+    uploadImageBtn.disabled = imageUploading || !ws || ws.readyState !== WebSocket.OPEN;
+    uploadImageBtn.textContent = imageUploading ? 'Uploading...' : 'Add Image';
+    promptEditor.readOnly = !isInterviewer || imageUploading;
+    presetPicker.disabled = imageUploading;
+  }
+
+  function finishImageUpload() {
+    imageUploading = false;
+    updateImageControls();
+  }
+
+  async function uploadPromptImage(file) {
+    if (selfRole !== 'interviewer' || imageUploading || !file) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) { showToast('Wait for the room to reconnect.'); return; }
+    if (file.size > 5 * 1024 * 1024) { showToast('Images must be 5 MB or smaller.'); return; }
+    if (!['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(file.type)) {
+      showToast('Use a PNG, JPEG, GIF, or WebP image.');
+      return;
     }
-    if (inList) html += '</ul>';
-    if (inCodeBlock) html += `<pre><code>${escapeHtml(codeBlockLines.join('\n'))}</code></pre>`;
-    return html || '<p style="color: var(--text-muted);">No problem prompt written yet.</p>';
+    const stageId = activeStageId;
+    const connection = ws;
+    flushPromptChange();
+    imageUploading = true;
+    updateImageControls();
+    try {
+      const data = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result).split(',')[1]);
+        reader.onerror = () => reject(new Error('Could not read that image.'));
+        reader.readAsDataURL(file);
+      });
+      if (connection !== ws || ws.readyState !== WebSocket.OPEN) throw new Error('Connection lost. Please upload the image again.');
+      sendWs({ type: 'upload_image', stageId, filename: file.name, data });
+    } catch (err) {
+      finishImageUpload();
+      showToast(err.message || 'Image upload failed.');
+    }
   }
 
   function updatePromptUI(markdown, updateTextarea = true) {
     if (updateTextarea) promptEditor.value = markdown;
     promptPreview.innerHTML = renderMarkdown(markdown);
+  }
+
+  function renderStages() {
+    const isInterviewer = selfRole === 'interviewer';
+    const connected = ws && ws.readyState === WebSocket.OPEN;
+    stageSelect.replaceChildren(...stages.map((stage) => {
+      const option = document.createElement('option');
+      option.value = stage.id;
+      option.textContent = stage.title;
+      return option;
+    }));
+    stageSelect.value = activeStageId || '';
+    stageSelect.disabled = !isInterviewer || !connected;
+    stageControls.hidden = !isInterviewer;
+    const index = stages.findIndex((stage) => stage.id === activeStageId);
+    stageProgress.textContent = index < 0 ? '' : `${index + 1} of ${stages.length}`;
+    previousStageBtn.disabled = !connected || index <= 0;
+    nextStageBtn.disabled = !connected || index < 0 || index >= stages.length - 1;
+    addStageBtn.disabled = !connected || stages.length >= 20;
+    renameStageBtn.disabled = !connected || index < 0;
+    removeStageBtn.disabled = !connected || stages.length <= 1;
+  }
+
+  function flushPromptChange() {
+    if (!promptDebounce) return;
+    clearTimeout(promptDebounce);
+    promptDebounce = null;
+    if (selfRole === 'interviewer') {
+      sendWs({ type: 'prompt_change', stageId: activeStageId, promptMarkdown: promptEditor.value });
+    }
+  }
+
+  function changeStage(stageId) {
+    if (selfRole !== 'interviewer' || !stageId || stageId === activeStageId) return;
+    flushPromptChange();
+    flushCodeChange();
+    sendWs({ type: 'stage_change', stageId });
+  }
+
+  function flushCodeChange() {
+    clearTimeout(codeDebounce);
+    codeDebounce = null;
+    if (!pendingCodeChange) return;
+    sendWs(pendingCodeChange);
+    pendingCodeChange = null;
   }
 
   function getEditorValue() {
@@ -167,7 +237,16 @@
     suppressEditorChange = true;
     try {
       if (editor) {
-        const model = editor.getModel();
+        const key = `${activeStageId || 'loading'}:${lang}`;
+        let model = editorModels.get(key);
+        if (!model) {
+          model = window.monaco.editor.createModel(newCode, getMonacoLang(lang));
+          editorModels.set(key, model);
+        }
+        if (editor.getModel() !== model) {
+          decorationIds = editor.deltaDecorations(decorationIds, []);
+          editor.setModel(model);
+        }
         if (window.monaco && model) window.monaco.editor.setModelLanguage(model, getMonacoLang(lang));
         if (editor.getValue() !== newCode) {
           const pos = editor.getPosition();
@@ -183,6 +262,9 @@
   }
 
   function sendWs(payload) {
+    if (['code_change', 'cursor_change', 'language_change', 'reset_template', 'run_code'].includes(payload.type)) {
+      payload = { stageId: activeStageId, ...payload };
+    }
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
   }
 
@@ -210,22 +292,30 @@
         });
         editor.addCommand(window.monaco.KeyMod.CtrlCmd | window.monaco.KeyCode.Enter, () => triggerRunCode());
 
-        let codeDebounce = null;
+        // Keep each stage/language in its own model, including its undo history.
+        editorModels.set(`${activeStageId || 'loading'}:${currentLanguage}`, editor.getModel());
         editor.onDidChangeModelContent(() => {
           if (suppressEditorChange) return;
           const val = editor.getValue();
           const language = currentLanguage;
           codes[language] = val;
-          if (codeDebounce) clearTimeout(codeDebounce);
-          codeDebounce = setTimeout(() => sendWs({ type: 'code_change', language, code: val }), 60);
+          if (pendingCodeChange && (pendingCodeChange.stageId !== activeStageId || pendingCodeChange.language !== language)) {
+            flushCodeChange();
+          }
+          pendingCodeChange = { type: 'code_change', stageId: activeStageId, language, code: val };
+          clearTimeout(codeDebounce);
+          codeDebounce = setTimeout(flushCodeChange, 60);
         });
 
         let cursorDebounce = null;
         editor.onDidChangeCursorSelection((e) => {
+          if (suppressEditorChange) return;
+          const stageId = activeStageId;
+          const language = currentLanguage;
           if (cursorDebounce) clearTimeout(cursorDebounce);
           cursorDebounce = setTimeout(() => {
             sendWs({
-              type: 'cursor_change', language: currentLanguage,
+              type: 'cursor_change', stageId, language,
               position: e.selection.getPosition(),
               selection: {
                 startLineNumber: e.selection.startLineNumber, startColumn: e.selection.startColumn,
@@ -257,6 +347,7 @@
     for (const [uid, info] of remoteCursors.entries()) {
       if (uid === selfId) continue;
       if (!info.cursor || info.cursor.language !== currentLanguage) continue;
+      if (info.cursor.stageId && info.cursor.stageId !== activeStageId) continue;
       const safeUid = uid.replace(/[^a-zA-Z0-9]/g, '');
       const color = info.color || '#38bdf8';
       dynamicCss += `.remote-cursor-${safeUid} { border-left: 2px solid ${color} !important; }\n`;
@@ -315,6 +406,9 @@
     timerStartPauseBtn.disabled = !isInt;
     timerResetBtn.disabled = !isInt;
     resetTemplateBtn.disabled = !isInt;
+    promptEditor.readOnly = !isInt;
+    updateImageControls();
+    renderStages();
 
     if (!isInt) {
       if (localStorage.getItem('webcoder_role_notice_dismissed') === '1') {
@@ -323,7 +417,7 @@
       } else {
         roleNotice.style.display = '';
         roleNotice.innerHTML = `
-          <span class="role-notice-text">You are the interviewee. Only the interviewer can edit the problem prompt, load presets, rename the room, reset starter code, and control the timer.</span>
+          <span class="role-notice-text">You are the interviewee. Only the interviewer can change stages, edit the problem prompt, load presets, rename the room, reset starter code, and control the timer.</span>
           <button type="button" class="role-notice-close" title="Dismiss">×</button>
         `;
         const closeBtn = roleNotice.querySelector('.role-notice-close');
@@ -434,6 +528,7 @@
 
   function triggerRunCode() {
     if (isRunning) return;
+    flushCodeChange();
     const currentCode = getEditorValue();
     codes[currentLanguage] = currentCode;
     sendWs({ type: 'run_code', language: currentLanguage, code: currentCode, stdin: stdinTextarea.value });
@@ -478,6 +573,13 @@
           document.title = `${room.title} — WebCoder`;
           roomTitleInput.value = room.title;
           roomIsProtected = Boolean(room.isProtected);
+          stages = room.stages || [];
+          activeStageId = room.activeStageId;
+          clearTimeout(codeDebounce);
+          codeDebounce = null;
+          pendingCodeChange = null;
+          clearTimeout(promptDebounce);
+          promptDebounce = null;
           currentLanguage = room.language || 'python';
           codes = room.codes || codes;
           languageSelect.value = currentLanguage;
@@ -536,16 +638,21 @@
 
         case 'permission_denied':
           pendingPasswordCookie = null;
+          if (msg.action === 'upload_image') finishImageUpload();
           if (msg.action === 'claim_interviewer' && claimInterviewerBtn) {
             claimInterviewerBtn.style.display = 'none';
           }
           showToast(msg.message || 'Only the interviewer can perform this action.');
           break;
 
-        case 'code_update':
+        case 'code_update': {
+          const stage = stages.find((item) => item.id === msg.stageId);
+          if (stage && stage.codes) stage.codes[msg.language] = msg.code;
+          if (msg.stageId && msg.stageId !== activeStageId) break;
           codes[msg.language] = msg.code;
           if (msg.language === currentLanguage) setEditorValue(msg.code, currentLanguage);
           break;
+        }
 
         case 'cursor_update':
           remoteCursors.set(msg.userId, { name: msg.name, color: msg.color, cursor: msg.cursor });
@@ -553,6 +660,7 @@
           break;
 
         case 'language_update': {
+          if (msg.stageId && msg.stageId !== activeStageId) break;
           currentLanguage = msg.language;
           codes[currentLanguage] = msg.code;
           languageSelect.value = currentLanguage;
@@ -563,7 +671,47 @@
           break;
         }
 
-        case 'prompt_update': updatePromptUI(msg.promptMarkdown, true); break;
+        case 'stages_updated': {
+          const changed = activeStageId !== msg.activeStageId;
+          if (changed) {
+            // Save a candidate's pending edit to the stage it was typed in.
+            flushCodeChange();
+          }
+          stages = msg.stages;
+          if (changed) {
+            clearTimeout(promptDebounce);
+            promptDebounce = null;
+            activeStageId = msg.activeStageId;
+            const stage = stages.find((item) => item.id === activeStageId);
+            updatePromptUI(stage ? stage.promptMarkdown : '', true);
+            codes = stage ? stage.codes : {};
+            setEditorValue(codes[currentLanguage] || '', currentLanguage);
+            remoteCursors.clear();
+            renderRemoteCursors();
+            showToast(`${msg.senderName} switched to ${stage ? stage.title : 'another stage'}.`);
+          }
+          renderStages();
+          break;
+        }
+
+        case 'action_error': showToast(msg.message); break;
+
+        case 'image_uploaded':
+          finishImageUpload();
+          showToast(msg.stageId === activeStageId ? 'Image added to the question.' : 'Image added to its original stage.');
+          break;
+
+        case 'image_upload_error':
+          finishImageUpload();
+          showToast(msg.message || 'Image upload failed.');
+          break;
+
+        case 'prompt_update': {
+          const stage = stages.find((item) => item.id === msg.stageId);
+          if (stage) stage.promptMarkdown = msg.promptMarkdown;
+          if (!msg.stageId || msg.stageId === activeStageId) updatePromptUI(msg.promptMarkdown, true);
+          break;
+        }
         case 'stdin_update': stdinTextarea.value = msg.stdin; break;
 
         case 'title_update':
@@ -593,6 +741,7 @@
         }
 
         case 'preset_loaded':
+          if (msg.stageId && msg.stageId !== activeStageId) break;
           updatePromptUI(msg.promptMarkdown, true);
           if (msg.replaceCode && msg.codes) {
             codes = msg.codes;
@@ -614,6 +763,8 @@
     });
 
     ws.addEventListener('close', (event) => {
+      finishImageUpload();
+      renderStages();
       if (event.code === 1008 && /password/i.test(event.reason || '')) {
         syncIndicator.textContent = '● Password required';
         syncIndicator.style.color = '#d29922';
@@ -628,6 +779,62 @@
   }
 
   // ---- Event wiring ----
+  uploadImageBtn.addEventListener('click', () => promptImageInput.click());
+  promptImageInput.addEventListener('change', () => {
+    uploadPromptImage(promptImageInput.files[0]);
+    promptImageInput.value = '';
+  });
+  promptBody.addEventListener('paste', (event) => {
+    if (selfRole !== 'interviewer') return;
+    const file = Array.from(event.clipboardData?.files || []).find((item) => item.type.startsWith('image/'));
+    if (file) { event.preventDefault(); uploadPromptImage(file); }
+  });
+  promptBody.addEventListener('dragover', (event) => {
+    if (selfRole !== 'interviewer' || !Array.from(event.dataTransfer?.types || []).includes('Files')) return;
+    event.preventDefault();
+    promptBody.classList.add('image-drag-over');
+  });
+  promptBody.addEventListener('dragleave', () => promptBody.classList.remove('image-drag-over'));
+  promptBody.addEventListener('drop', (event) => {
+    promptBody.classList.remove('image-drag-over');
+    if (selfRole !== 'interviewer') return;
+    event.preventDefault();
+    uploadPromptImage(event.dataTransfer?.files[0]);
+  });
+
+  stageSelect.addEventListener('change', () => changeStage(stageSelect.value));
+  previousStageBtn.addEventListener('click', () => {
+    const index = stages.findIndex((stage) => stage.id === activeStageId);
+    changeStage(stages[index - 1]?.id);
+  });
+  nextStageBtn.addEventListener('click', () => {
+    const index = stages.findIndex((stage) => stage.id === activeStageId);
+    changeStage(stages[index + 1]?.id);
+  });
+  addStageBtn.addEventListener('click', () => {
+    if (selfRole !== 'interviewer') return;
+    const title = prompt('Name the new stage. It starts with a blank prompt and fresh starter code.', `Stage ${stages.length + 1}`);
+    if (!title || !title.trim()) return;
+    flushPromptChange();
+    flushCodeChange();
+    sendWs({ type: 'stage_add', title });
+  });
+  renameStageBtn.addEventListener('click', () => {
+    if (selfRole !== 'interviewer') return;
+    const stage = stages.find((item) => item.id === activeStageId);
+    if (!stage) return;
+    const title = prompt('Rename this stage:', stage.title);
+    if (title && title.trim()) sendWs({ type: 'stage_rename', stageId: stage.id, title });
+  });
+  removeStageBtn.addEventListener('click', () => {
+    if (selfRole !== 'interviewer' || stages.length <= 1) return;
+    const stage = stages.find((item) => item.id === activeStageId);
+    if (!stage || !confirm(`Remove "${stage.title}" and its problem prompt and code?`)) return;
+    flushPromptChange();
+    flushCodeChange();
+    sendWs({ type: 'stage_remove', stageId: stage.id });
+  });
+
   runBtn.addEventListener('click', triggerRunCode);
   window.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); triggerRunCode(); }
@@ -637,6 +844,7 @@
   timerResetBtn.addEventListener('click', () => sendWs({ type: 'timer_action', action: 'reset' }));
 
   languageSelect.addEventListener('change', () => {
+    flushCodeChange();
     const nextLang = languageSelect.value;
     codes[currentLanguage] = getEditorValue();
     sendWs({ type: 'code_change', language: currentLanguage, code: codes[currentLanguage] });
@@ -653,6 +861,7 @@
 
   resetTemplateBtn.addEventListener('click', () => {
     if (!confirm(`Reset ${langMeta(currentLanguage).label} code to default starter template?`)) return;
+    flushCodeChange();
     sendWs({ type: 'reset_template' });
   });
 
@@ -741,6 +950,7 @@
     promptEditor.style.display = 'none';
   });
   promptEditTab.addEventListener('click', () => {
+    if (selfRole !== 'interviewer') return;
     promptEditTab.classList.add('active');
     promptPreviewTab.classList.remove('active');
     promptEditor.style.display = '';
@@ -750,17 +960,24 @@
 
   let promptDebounce = null;
   promptEditor.addEventListener('input', () => {
+    if (selfRole !== 'interviewer') return;
     const md = promptEditor.value;
+    const stageId = activeStageId;
     updatePromptUI(md, false);
     if (promptDebounce) clearTimeout(promptDebounce);
-    promptDebounce = setTimeout(() => sendWs({ type: 'prompt_change', promptMarkdown: md }), 120);
+    promptDebounce = setTimeout(() => {
+      promptDebounce = null;
+      sendWs({ type: 'prompt_change', stageId, promptMarkdown: md });
+    }, 120);
   });
 
   presetPicker.addEventListener('change', () => {
     const presetId = presetPicker.value;
     if (!presetId) return;
     const replaceCode = confirm('Also replace the code editor with this problem’s starter template? (Cancel = only update the Problem Prompt)');
-    sendWs({ type: 'load_preset', presetId, replaceCode });
+    flushPromptChange();
+    flushCodeChange();
+    sendWs({ type: 'load_preset', stageId: activeStageId, presetId, replaceCode });
     presetPicker.value = '';
   });
 

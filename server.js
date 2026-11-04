@@ -30,6 +30,8 @@ const {
   parseCookies
 } = require('./src/auth');
 const { LANGUAGES, DEFAULT_TEMPLATES, PROBLEM_PRESETS, getPresetById } = require('./src/presets');
+const { MAX_STAGES, createStage, syncActiveStage, activateStage, getStageState } = require('./src/stages');
+const { UPLOADS_DIR, IMAGE_TYPES, saveImage } = require('./src/images');
 const { executeCode, CONTAINER_RUNTIME, SANDBOX_IMAGE } = require('./src/runner');
 const { getVSCodeSession, destroyVSCodeSession } = require('./src/vscode');
 const httpProxy = require('http-proxy');
@@ -54,12 +56,17 @@ const USER_COLORS = [
 // Actions that only the interviewer may perform
 const INTERVIEWER_ONLY_ACTIONS = new Set([
   'prompt_change',
+  'upload_image',
   'load_preset',
   'title_change',
   'reset_template',
   'timer_action',
   'role_change',
-  'password_change'
+  'password_change',
+  'stage_add',
+  'stage_change',
+  'stage_rename',
+  'stage_remove'
 ]);
 
 // Active rooms in memory: roomId -> { data, clients: Map<ws, clientInfo>, saveTimer, isRunning, timer }
@@ -416,6 +423,22 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 201, { room });
     }
 
+    const roomImageMatch = pathname.match(/^\/api\/rooms\/([a-zA-Z0-9_-]+)\/images\/([a-f0-9]{32}\.(png|jpg|gif|webp))$/);
+    if (req.method === 'GET' && roomImageMatch) {
+      const [, roomId, filename, extension] = roomImageMatch;
+      if (!isRequestAuthorized(req, roomId)) {
+        return sendJson(res, 401, { error: 'Password required.', locked: true });
+      }
+      if (!getRoom(roomId)) return sendJson(res, 404, { error: 'Room not found.' });
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cache-Control', 'private, no-store');
+      return fs.readFile(path.join(UPLOADS_DIR, roomId, filename), (err, content) => {
+        if (err) return sendJson(res, 404, { error: 'Image not found.' });
+        res.writeHead(200, { 'Content-Type': IMAGE_TYPES[extension] });
+        res.end(content);
+      });
+    }
+
     // Room access state (used by the unlock page)
     const roomAccessMatch = pathname.match(/^\/api\/rooms\/([a-zA-Z0-9_-]+)\/access$/);
     if (req.method === 'GET' && roomAccessMatch) {
@@ -500,6 +523,7 @@ const server = http.createServer(async (req, res) => {
         }
         destroyVSCodeSession(roomId);
         deleteRoom(roomId);
+        await fs.promises.rm(path.join(UPLOADS_DIR, roomId), { recursive: true, force: true });
         return sendJson(res, 200, { ok: true });
       }
     }
@@ -658,7 +682,81 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
+    // Code edits may finish saving to their original stage after a switch.
+    // Other editor actions only apply while that stage is still active.
+    if (['cursor_change', 'language_change', 'reset_template', 'run_code'].includes(msg.type)
+        && msg.stageId && msg.stageId !== entry.data.activeStageId) return;
+
     switch (msg.type) {
+      case 'upload_image': {
+        const room = entry.data;
+        const stage = room.stages.find((item) => item.id === msg.stageId);
+        if (!stage || room.layout !== 'legacy') {
+          sendTo(ws, { type: 'image_upload_error', message: 'That stage no longer exists.' });
+          break;
+        }
+        let saved;
+        try {
+          saved = await saveImage(roomId, msg.data);
+          if (!isInterviewer(clientInfo) || !room.stages.includes(stage) || activeRooms.get(roomId) !== entry) {
+            throw new Error('The stage or your interviewer permissions changed. Please try again.');
+          }
+          syncActiveStage(room);
+          const alt = String(msg.filename || 'Question image').replace(/\.[^.]+$/, '')
+            .replace(/[\[\]\\\r\n`*]/g, ' ').trim().slice(0, 100) || 'Question image';
+          const markdown = `${stage.promptMarkdown.trimEnd()}\n\n![${alt}](${saved.url})\n`;
+          if (markdown.length > 256 * 1024) throw new Error('The problem description is too long to add an image.');
+          stage.promptMarkdown = markdown;
+          if (stage.id === room.activeStageId) room.promptMarkdown = markdown;
+          scheduleRoomSave(entry, true);
+          broadcast(entry, { type: 'prompt_update', stageId: stage.id, promptMarkdown: markdown });
+          sendTo(ws, { type: 'image_uploaded', stageId: stage.id, url: saved.url });
+        } catch (err) {
+          if (saved) await fs.promises.unlink(saved.filePath).catch(() => {});
+          sendTo(ws, { type: 'image_upload_error', message: err.message || 'Image upload failed.' });
+        }
+        break;
+      }
+
+      case 'stage_add':
+      case 'stage_change':
+      case 'stage_rename':
+      case 'stage_remove': {
+        if (entry.data.layout !== 'legacy') break;
+        const room = entry.data;
+        const title = typeof msg.title === 'string' ? msg.title.trim().slice(0, 80) : '';
+        const target = room.stages.find((stage) => stage.id === msg.stageId);
+        syncActiveStage(room);
+        if (msg.type === 'stage_add') {
+          if (room.stages.length >= MAX_STAGES) {
+            sendTo(ws, { type: 'action_error', message: `A room can have at most ${MAX_STAGES} stages.` });
+            break;
+          }
+          const stage = createStage(title || `Stage ${room.stages.length + 1}`);
+          room.stages.push(stage);
+          activateStage(room, stage);
+        } else {
+          if (!target) break;
+          if (msg.type === 'stage_change') {
+            activateStage(room, target);
+          } else if (msg.type === 'stage_rename') {
+            if (!title) break;
+            target.title = title;
+          } else {
+            if (room.stages.length === 1) break;
+            const index = room.stages.indexOf(target);
+            room.stages.splice(index, 1);
+            if (room.activeStageId === target.id) {
+              const next = room.stages[Math.min(index, room.stages.length - 1)];
+              activateStage(room, next);
+            }
+          }
+        }
+        scheduleRoomSave(entry, true);
+        broadcast(entry, { type: 'stages_updated', ...getStageState(room), senderName: clientInfo.name });
+        break;
+      }
+
       case 'join':
       case 'rename_user': {
         const cleanName = String(msg.name || '').trim().slice(0, 32);
@@ -736,16 +834,19 @@ wss.on('connection', (ws, req) => {
       }
 
       case 'code_change': {
+        const stage = entry.data.stages.find((item) => item.id === (msg.stageId || entry.data.activeStageId));
+        if (!stage) break;
         const lang = LANGUAGES.includes(msg.language)
           ? msg.language
           : entry.data.language;
         if (typeof msg.code === 'string' && msg.code.length <= 512 * 1024) {
-          entry.data.codes[lang] = msg.code;
+          stage.codes[lang] = msg.code;
           scheduleRoomSave(entry);
           broadcast(
             entry,
             {
               type: 'code_update',
+              stageId: stage.id,
               language: lang,
               code: msg.code,
               senderId: clientInfo.identityId
@@ -758,6 +859,7 @@ wss.on('connection', (ws, req) => {
 
       case 'cursor_change': {
         clientInfo.cursor = {
+          stageId: entry.data.activeStageId,
           language: msg.language || entry.data.language,
           position: msg.position || null,
           selection: msg.selection || null
@@ -782,6 +884,7 @@ wss.on('connection', (ws, req) => {
           scheduleRoomSave(entry);
           broadcast(entry, {
             type: 'language_update',
+            stageId: entry.data.activeStageId,
             language: entry.data.language,
             code: entry.data.codes[entry.data.language],
             senderId: clientInfo.identityId,
@@ -792,6 +895,7 @@ wss.on('connection', (ws, req) => {
       }
 
       case 'prompt_change': {
+        if (msg.stageId && msg.stageId !== entry.data.activeStageId) break;
         if (typeof msg.promptMarkdown === 'string' && msg.promptMarkdown.length <= 256 * 1024) {
           entry.data.promptMarkdown = msg.promptMarkdown;
           scheduleRoomSave(entry);
@@ -800,6 +904,7 @@ wss.on('connection', (ws, req) => {
             {
               type: 'prompt_update',
               promptMarkdown: entry.data.promptMarkdown,
+              stageId: entry.data.activeStageId,
               senderId: clientInfo.identityId
             },
             ws
@@ -866,6 +971,7 @@ wss.on('connection', (ws, req) => {
         scheduleRoomSave(entry, true);
         broadcast(entry, {
           type: 'code_update',
+          stageId: entry.data.activeStageId,
           language: lang,
           code: defaultCode,
           senderId: clientInfo.identityId,
@@ -875,6 +981,7 @@ wss.on('connection', (ws, req) => {
       }
 
       case 'load_preset': {
+        if (msg.stageId && msg.stageId !== entry.data.activeStageId) break;
         const preset = getPresetById(msg.presetId);
         if (preset) {
           entry.data.promptMarkdown = preset.prompt;
@@ -888,6 +995,7 @@ wss.on('connection', (ws, req) => {
             type: 'preset_loaded',
             presetId: preset.id,
             promptMarkdown: entry.data.promptMarkdown,
+            stageId: entry.data.activeStageId,
             codes: entry.data.codes,
             language: entry.data.language,
             replaceCode: Boolean(msg.replaceCode),

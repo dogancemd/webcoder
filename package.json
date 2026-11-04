@@ -4,6 +4,7 @@
   "description": "Collaborative interview coding pad supporting Python, JavaScript, C++, Java, Go, and Rust with isolated container execution",
   "main": "server.js",
   "scripts": {
+    "test": "node --test",
     "start": "node server.js",
     "dev": "node --watch server.js",
     "build:sandbox": "podman build -t webcoder-sandbox:latest ./sandbox || docker build -t webcoder-sandbox:latest ./sandbox",

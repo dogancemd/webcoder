@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { getPresetById, LANGUAGES } = require('./presets');
 const { hashPassword } = require('./auth');
+const { createStage, getStageState } = require('./stages');
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
 if (!fs.existsSync(DATA_DIR)) {
@@ -58,6 +59,9 @@ for (const col of ['code_rust', 'code_go', 'code_javascript', 'layout', 'passwor
     db.exec(`ALTER TABLE rooms ADD COLUMN ${col} TEXT NOT NULL DEFAULT ''`);
   }
 }
+if (!existingCols.includes('stages_json')) {
+  db.exec("ALTER TABLE rooms ADD COLUMN stages_json TEXT NOT NULL DEFAULT 'null'");
+}
 
 // Retire the custom VS Code layout without changing saved room content.
 db.exec("UPDATE rooms SET layout = 'legacy' WHERE layout != 'vscode-server' AND layout != 'legacy'");
@@ -83,6 +87,7 @@ const stmts = {
         prompt_markdown = ?,
         stdin = ?,
         last_output_json = ?,
+        stages_json = ?,
         updated_at = ?
     WHERE id = ?
   `),
@@ -140,21 +145,42 @@ function hydrateRoomRow(row) {
   } catch {
     lastOutput = null;
   }
+  let stageState;
+  const codes = {
+    python: row.code_python,
+    cpp: row.code_cpp,
+    java: row.code_java,
+    rust: row.code_rust,
+    go: row.code_go,
+    javascript: row.code_javascript
+  };
+  try { stageState = JSON.parse(row.stages_json || 'null'); } catch {}
+  let migratedStages = false;
+  if (!stageState || !Array.isArray(stageState.stages) || !stageState.stages.length) {
+    const stage = createStage('Stage 1', row.prompt_markdown, codes);
+    stageState = { stages: [stage], activeStageId: stage.id };
+    migratedStages = true;
+  }
+  for (const stage of stageState.stages) {
+    if (!stage.codes) {
+      // Previously all stages shared these buffers. Preserve that code in each
+      // existing stage when migrating to independent buffers.
+      stage.codes = { ...codes };
+      migratedStages = true;
+    }
+  }
+  if (migratedStages) {
+    db.prepare('UPDATE rooms SET stages_json = ? WHERE id = ?').run(JSON.stringify(stageState), row.id);
+  }
   return {
     id: row.id,
     title: row.title,
     language: row.language,
     layout: row.layout === 'vscode-server' ? 'vscode-server' : 'legacy',
     isProtected: Boolean(row.password_hash),
-    codes: {
-      python: row.code_python,
-      cpp: row.code_cpp,
-      java: row.code_java,
-      rust: row.code_rust,
-      go: row.code_go,
-      javascript: row.code_javascript
-    },
+    codes: stageState.stages.find((stage) => stage.id === stageState.activeStageId)?.codes || codes,
     promptMarkdown: row.prompt_markdown,
+    ...stageState,
     stdin: row.stdin || '',
     lastOutput,
     createdAt: row.created_at,
@@ -224,6 +250,7 @@ function saveRoomState(room) {
     room.promptMarkdown,
     room.stdin || '',
     JSON.stringify(room.lastOutput || null),
+    JSON.stringify(getStageState(room)),
     now,
     room.id
   );

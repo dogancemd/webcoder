@@ -47,6 +47,24 @@
     </div>
   </header>
 
+  <nav class="stage-bar" aria-label="Interview stages">
+    <div class="stage-selection">
+      <label for="stageSelect">Stage</label>
+      <select id="stageSelect" class="mini-select" disabled aria-describedby="stageHint">
+        <option>Loading...</option>
+      </select>
+      <span id="stageProgress" class="stage-progress" aria-live="polite"></span>
+    </div>
+    <span id="stageHint" class="stage-hint">Only the interviewer can change stages. Each stage saves its own code.</span>
+    <div id="stageControls" class="stage-controls" hidden>
+      <button type="button" id="previousStageBtn" class="btn btn-subtle" disabled>Previous</button>
+      <button type="button" id="nextStageBtn" class="btn btn-subtle" disabled>Next</button>
+      <button type="button" id="addStageBtn" class="btn btn-subtle">+ Add Stage</button>
+      <button type="button" id="renameStageBtn" class="btn btn-subtle">Rename</button>
+      <button type="button" id="removeStageBtn" class="btn btn-subtle" disabled>Remove</button>
+    </div>
+  </nav>
+
   <!-- 3-PANE WORKSPACE -->
   <main class="legacy-workspace" id="workspace">
     <!-- Left Pane: Problem Prompt -->
@@ -68,7 +86,12 @@
           </select>
         </div>
       </div>
-      <div class="prompt-body">
+      <div id="promptImageTools" class="prompt-image-tools" hidden>
+        <button type="button" id="uploadImageBtn" class="btn btn-subtle">Add Image</button>
+        <span>Paste or drop an image · up to 5 MB</span>
+        <input id="promptImageInput" type="file" accept="image/png,image/jpeg,image/gif,image/webp" hidden />
+      </div>
+      <div class="prompt-body" id="promptBody">
         <div id="roleNotice" class="role-notice" style="display: none;"></div>
         <div id="promptPreview" class="markdown-view"></div>
         <textarea id="promptEditor" class="prompt-editor" style="display: none;" placeholder="Write problem description in Markdown..."></textarea>
@@ -141,6 +164,7 @@
   <div id="toast" class="toast"></div>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs/loader.min.js"></script>
+  <script src="/markdown.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

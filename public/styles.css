@@ -493,6 +493,21 @@ html, body {
 .markdown-view pre { background: var(--bg-primary); border: 1px solid var(--border-color); border-radius: 5px; padding: 10px; overflow-x: auto; margin-bottom: 12px; }
 .markdown-view pre code { background: transparent; padding: 0; }
 .markdown-view hr { border: none; border-top: 1px solid var(--border-color); margin: 14px 0; }
+.markdown-view img { display: inline-block; max-width: 100%; height: auto; vertical-align: middle; border-radius: 5px; }
+
+.prompt-image-tools {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.prompt-image-tools[hidden] { display: none; }
+.prompt-body.image-drag-over { outline: 2px dashed var(--accent-blue); outline-offset: -4px; }
 
 .prompt-editor {
   flex: 1;
@@ -587,6 +602,32 @@ html, body {
 }
 
 /* CoderPad layout */
+.legacy-layout .stage-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 8px 12px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+  font-size: 12px;
+}
+
+.stage-selection, .stage-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.stage-controls[hidden] { display: none; }
+.stage-selection label { color: var(--text-secondary); font-weight: 600; }
+.stage-selection select { max-width: 240px; min-width: 100px; padding: 5px 8px; }
+.stage-progress { color: var(--accent-blue); white-space: nowrap; }
+.stage-hint { flex: 1; color: var(--text-muted); }
+.stage-controls { flex-wrap: wrap; }
+
 .legacy-layout .legacy-workspace {
   flex: 1;
   display: flex;
