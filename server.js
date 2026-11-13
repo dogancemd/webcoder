@@ -35,6 +35,7 @@ const { UPLOADS_DIR, IMAGE_TYPES, saveImage } = require('./src/images');
 const { executeCode, CONTAINER_RUNTIME, SANDBOX_IMAGE } = require('./src/runner');
 const { getVSCodeSession, destroyVSCodeSession } = require('./src/vscode');
 const httpProxy = require('http-proxy');
+const { createMcpHandler } = require('./src/mcp');
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -332,10 +333,37 @@ vsProxy.on('error', (err, req, res) => {
 
 const VSROOM_PATH_RE = /^\/vsroom\/([a-zA-Z0-9_-]+)(\/.*)?$/;
 
+// MCP must use live state rather than a potentially stale database snapshot.
+const handleMcp = createMcpHandler({
+  getRoom(id) {
+    const room = activeRooms.get(id)?.data || getRoom(id);
+    if (!room) throw new Error('Room not found.');
+    getStageState(room);
+    return room;
+  },
+  listRooms: listRecentRooms,
+  createRoom,
+  commitRoom(room, events, stagesChanged = true) {
+    const entry = activeRooms.get(room.id);
+    saveRoomState(room); // Surface persistence errors before changing live state.
+    if (!entry) return;
+    if (entry.saveTimer) clearTimeout(entry.saveTimer);
+    entry.saveTimer = null;
+    // Keep the room object identity: in-flight uploads/runs may hold a reference.
+    Object.assign(entry.data, room);
+    if (stagesChanged) broadcast(entry, {
+      type: 'stages_updated', ...getStageState(room), senderName: 'AI agent'
+    });
+    for (const event of events) broadcast(entry, { ...event, senderName: 'AI agent' });
+  }
+});
+
 const server = http.createServer(async (req, res) => {
   try {
     const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname;
+
+    if (pathname === '/mcp') return await handleMcp(req, res);
 
     // Per-room VS Code server reverse proxy
     const vsMatch = pathname.match(VSROOM_PATH_RE);
@@ -1141,6 +1169,6 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`WebCoder interview server running on http://${HOST}:${PORT}`);
+  console.log(`WebCoder interview server running on http://${HOST}:${server.address().port}`);
   console.log(`Sandbox runtime: ${CONTAINER_RUNTIME || 'none'} (image: ${SANDBOX_IMAGE})`);
 });

@@ -16,6 +16,7 @@ The project aims to make technical interviews easy to host on your own infrastru
 - **Multi-stage interviews:** CoderPad rooms support up to 20 named stages, each with its own saved problem prompt and code buffers for every language. New stages start with fresh starter code, and switching back restores that stage's code. Only interviewers can add, rename, remove, or switch stages. Everyone follows the active stage in real time; the selected language, stdin, output, and timer are shared across stages. Existing rooms retain their code when upgraded.
 - **Optional room passwords:** protect room pages, live state, API data, and the VS Code workspace. Browser unlocks last 24 hours; changing the password invalidates existing unlocks and invite links. **Copy Invite Link** embeds a signed token so invitees join without typing the password.
 - **Interviewer controls:** manage the prompt, load presets, rename the room, reset starter code, control the timer, and promote or demote participants. Everyone can edit and run code. If no interviewer is currently present, any participant can use **Become Interviewer** to take over.
+- **AI agent tools:** an optional authenticated MCP endpoint lets agents create rooms and add, edit, reorder, switch, or delete questions, with live updates for participants.
 - **Persistent rooms:** SQLite stores room content and browser-linked participant roles across server restarts. VS Code files live in a persistent container volume.
 - **Container-based execution:** classic-editor runs use temporary containers with resource limits and no network access.
 
@@ -93,6 +94,8 @@ Set environment variables when starting the server:
 | `HOST` | `0.0.0.0` | Address the HTTP server binds to |
 | `PORT` | `3000` | HTTP port |
 | `SANDBOX_IMAGE` | `webcoder-sandbox:latest` | Image used for classic-editor code execution |
+| `MCP_TOKEN` | unset (disabled) | Bearer token granting administrator access to MCP room and question tools |
+| `MCP_ALLOWED_ORIGINS` | empty | Comma-separated browser Origin values allowed on authenticated MCP requests; requests without Origin are accepted |
 | `VSCODE_IMAGE` | `webcoder-vscode:latest` | Image used for VS Code room containers |
 
 For example, to listen locally on a different port:
@@ -100,6 +103,50 @@ For example, to listen locally on a different port:
 ```bash
 HOST=127.0.0.1 PORT=8080 npm start
 ```
+
+### AI agents through MCP
+
+WebCoder exposes a stateless Streamable HTTP MCP endpoint at **`/mcp`** on the same port as the website. It is disabled unless `MCP_TOKEN` is set. Generate a secret, store it in your service environment, and restart WebCoder:
+
+```bash
+openssl rand -hex 32
+# Set MCP_TOKEN to the generated value in your environment or service configuration.
+MCP_TOKEN="your-generated-secret" npm start
+```
+
+Connect an MCP client that supports Streamable HTTP and custom authorization headers. A representative client configuration is below; the exact configuration format depends on your agent:
+
+```json
+{
+  "mcpServers": {
+    "webcoder": {
+      "url": "http://127.0.0.1:3000/mcp",
+      "headers": {
+        "Authorization": "Bearer your-generated-secret"
+      }
+    }
+  }
+}
+```
+
+Use your HTTPS website URL when connecting remotely. This endpoint uses a configured bearer token, not an OAuth sign-in flow. **The token grants administrator access to all rooms, including password-protected rooms**, independently of browser participant roles. Keep it private. Rotate it by changing `MCP_TOKEN` and restarting. Room passwords still control browser access; returned room links do not bypass them. Tokens are accepted only in the Authorization header, never in URLs. Browser requests carrying an Origin header are denied unless that exact origin appears in `MCP_ALLOWED_ORIGINS`; native agent clients normally omit Origin.
+
+| Tool | Purpose |
+| --- | --- |
+| `list_rooms` | List recent room summaries (`limit`, default 30, maximum 100) |
+| `get_room` | Read a room's current live questions and code using `roomId` |
+| `create_room` | Create a Classic CoderPad room with `title`, optional `language` and `password`; return its room and relative link |
+| `rename_room` | Update a room's `title` |
+| `add_question` | Append a question with `title`, `promptMarkdown`, optional per-language `starterCode`, and optional `activate` (default false) |
+| `edit_question` | Update `title` and/or `promptMarkdown` using `roomId` and `stageId` |
+| `set_question_code` | Explicitly replace one question's current code buffer using `language` and `code` |
+| `switch_question` | Switch everyone's active stage using `stageId` |
+| `reorder_questions` | Supply all question IDs exactly once in `stageIds` |
+| `delete_question` | Delete a stage and its code; the last stage cannot be deleted |
+
+Question tools operate on Classic CoderPad rooms. `get_room` returns stage IDs in `room.stages`; each stage is a question with independent code buffers. Prompt/title edits preserve candidate code. Adding a question leaves the current stage active unless `activate: true` is supplied. Only `set_question_code` explicitly replaces existing code; it can overwrite candidate work, so use it intentionally. Deleting the active question selects a neighboring stage and restores that stage's code. All successful edits are saved before returning and broadcast to connected participants. The existing limits apply: 20 stages per room, 80 characters per title, 262,144 characters per Markdown prompt, and 524,288 characters per language's code buffer. MCP request bodies are limited to 4 MiB.
+
+For example, ask your agent: “Read this room, clarify the first question's examples, and add a harder Python follow-up without switching the candidate to it.” The agent can call `get_room`, `edit_question`, and `add_question` in sequence. The agent generates the content; WebCoder provides the editing tools and does not require a model API key.
 
 ### Hosting
 
@@ -154,6 +201,7 @@ webcoder/
 ├── src/
 │   ├── auth.js              # Room passwords and signed access cookies
 │   ├── db.js                # SQLite schema, persistence, and participant roles
+│   ├── mcp.js               # Authenticated MCP room and question tools
 │   ├── presets.js           # Problem presets and language starter code
 │   ├── runner.js            # Temporary containers for code execution
 │   └── vscode.js            # Per-room VS Code containers and volumes

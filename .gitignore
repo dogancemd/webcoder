@@ -4,3 +4,6 @@
 /data/*.db-wal
 /data/*.db-journal
 /data/uploads/
+
+# Installed dependencies
+/node_modules/
