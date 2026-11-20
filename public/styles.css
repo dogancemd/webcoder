@@ -816,10 +816,15 @@ html, body {
 /* ---- Monaco Workspace (multi-file) ---- */
 .editor-split { flex: 1; display: flex; min-height: 0; min-width: 0; }
 .editor-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+/* The file tree sits at the top of the left pane, above the problem. */
 .ws-explorer {
-  width: 220px; min-width: 150px; max-width: 45%; display: flex; flex-direction: column;
-  background: var(--bg-secondary); border-right: 1px solid var(--border-color); resize: horizontal; overflow: hidden;
+  height: 40%; min-height: 80px; display: flex; flex-direction: column; flex-shrink: 0;
+  background: var(--bg-secondary); overflow: hidden;
 }
+.resizer-h {
+  height: 5px; flex-shrink: 0; cursor: row-resize; background: var(--border-color); transition: background 0.15s;
+}
+.resizer-h:hover, .resizer-h.dragging { background: var(--accent-blue); }
 .ws-explorer[hidden], .ws-tabs[hidden] { display: none; }
 .ws-explorer-head {
   display: flex; align-items: center; justify-content: space-between; padding: 6px 8px;

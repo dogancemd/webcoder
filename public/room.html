@@ -69,6 +69,19 @@
   <main class="legacy-workspace" id="workspace">
     <!-- Left Pane: Problem Prompt -->
     <section class="legacy-pane legacy-pane-prompt" id="promptPane">
+      <aside id="wsExplorer" class="ws-explorer" hidden aria-label="Workspace files">
+        <div class="ws-explorer-head">
+          <span>Files</span>
+          <div class="ws-explorer-actions">
+            <button type="button" data-action="new-file" title="New file">+ File</button>
+            <button type="button" data-action="new-folder" title="New folder">+ Folder</button>
+            <button type="button" data-action="collapse" title="Collapse all folders">⊟</button>
+          </div>
+        </div>
+        <div class="ws-tree" role="tree"></div>
+        <div class="ws-explorer-foot">Right-click for more · drag to move</div>
+      </aside>
+      <div class="resizer-h" id="explorerResizer" hidden title="Drag to resize the file tree"></div>
       <div class="pane-header">
         <div class="pane-title">
           <button type="button" class="tab-btn active" id="promptPreviewTab">Preview</button>
@@ -130,18 +143,6 @@
         </div>
       </div>
       <div class="editor-split">
-        <aside id="wsExplorer" class="ws-explorer" hidden aria-label="Workspace files">
-          <div class="ws-explorer-head">
-            <span>Files</span>
-            <div class="ws-explorer-actions">
-              <button type="button" data-action="new-file" title="New file">+ File</button>
-              <button type="button" data-action="new-folder" title="New folder">+ Folder</button>
-              <button type="button" data-action="collapse" title="Collapse all folders">⊟</button>
-            </div>
-          </div>
-          <div class="ws-tree" role="tree"></div>
-          <div class="ws-explorer-foot">Right-click for more · drag to move</div>
-        </aside>
         <div class="editor-main">
           <div id="wsTabs" class="ws-tabs" hidden></div>
           <div id="editorContainer" class="editor-container"></div>

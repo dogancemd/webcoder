@@ -101,6 +101,7 @@
   const toggleExplorerBtn = $('toggleExplorerBtn');
   const wsExplorer = $('wsExplorer');
   const wsTabs = $('wsTabs');
+  const explorerResizer = $('explorerResizer');
   const outputTab = $('outputTab');
   const aiTab = $('aiTab');
   const aiUnread = $('aiUnread');
@@ -163,8 +164,11 @@
     document.body.classList.add('workspace-mode');
     languagePicker.hidden = true;
     wsExplorer.hidden = false;
+    explorerResizer.hidden = false;
     wsTabs.hidden = false;
     toggleExplorerBtn.hidden = false;
+    toggleExplorerBtn.classList.add('active');
+    togglePromptBtn.textContent = '◧ Files & Problem';
     resetTemplateBtn.textContent = 'Reset Workspace';
     resetTemplateBtn.title = 'Replace this stage\'s files with the starter project';
     workspaceCtl = window.WebCoderWorkspace.createWorkspaceController({
@@ -1017,9 +1021,32 @@
   }
   togglePromptBtn.addEventListener('click', () => togglePane('left'));
   toggleExplorerBtn.addEventListener('click', () => {
-    wsExplorer.hidden = !wsExplorer.hidden;
-    toggleExplorerBtn.classList.toggle('active', !wsExplorer.hidden);
+    const show = wsExplorer.hidden || promptPane.classList.contains('collapsed');
+    if (show && promptPane.classList.contains('collapsed')) setPaneCollapsed('left', false);
+    wsExplorer.hidden = !show;
+    explorerResizer.hidden = !show;
+    toggleExplorerBtn.classList.toggle('active', show);
     if (editor) editor.layout();
+  });
+
+  // Drag the divider between the file tree and the problem in the left pane.
+  explorerResizer.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    const top = wsExplorer.getBoundingClientRect().top;
+    const paneBottom = promptPane.getBoundingClientRect().bottom;
+    explorerResizer.classList.add('dragging');
+    document.body.style.cursor = 'row-resize';
+    const move = (event) => {
+      wsExplorer.style.height = `${Math.max(80, Math.min(paneBottom - top - 120, event.clientY - top))}px`;
+    };
+    const up = () => {
+      explorerResizer.classList.remove('dragging');
+      document.body.style.cursor = '';
+      window.removeEventListener('mousemove', move);
+      window.removeEventListener('mouseup', up);
+    };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
   });
 
   // Output / AI tabs in the right pane
