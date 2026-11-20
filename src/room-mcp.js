@@ -36,8 +36,9 @@ Everything you do is visible to everyone in the room, including the interviewer:
 file edits and code runs are shown in the room's AI panel.
 
 Start with get_context. To talk with the people in the room, use send_message, and use
-wait_for_messages (pass the latest message id you have seen as afterId) to receive their replies;
-call it again whenever it times out without messages while the conversation is ongoing.
+wait_for_messages (pass the latest message id you have seen as afterId) to receive their replies.
+wait_for_messages waits as long as needed for someone to write; there is no need to poll. If it
+returns an error, the connection can no longer be used (for example it was revoked) - stop then.
 Keep chat replies concise and use Markdown code fences for code. Respect the interviewer's rules
 for the interview: if they ask you not to write code for the candidate, do not.`;
 
@@ -72,10 +73,10 @@ function createRoomMcpServer(session) {
     afterId, limit: z.number().int().min(1).max(200).default(50)
   }, ({ afterId, limit }) => ({ messages: session.readMessages(afterId, limit) }), read);
 
-  tool('wait_for_messages', 'Wait until someone else posts a chat message after afterId, then return the new messages. Returns an empty list after timeoutSeconds if nobody writes.', {
-    afterId, timeoutSeconds: z.number().int().min(1).max(55).default(25)
+  tool('wait_for_messages', 'Wait until someone else posts a chat message after afterId, then return the new messages. It waits as long as needed (no polling required) and returns an error only if this connection can no longer use the room. Set timeoutSeconds only if you want an empty result after that long.', {
+    afterId, timeoutSeconds: z.number().int().min(1).max(86400).optional()
   }, async ({ afterId, timeoutSeconds }, extra) => ({
-    messages: await session.waitForMessages(afterId, timeoutSeconds * 1000, extra.signal)
+    messages: await session.waitForMessages(afterId, timeoutSeconds ? timeoutSeconds * 1000 : 0, extra.signal)
   }), read);
 
   tool('run_code', 'Run the current code in the sandbox exactly like the room\'s Run button. The output is shown to everyone and returned here.', {
@@ -143,7 +144,9 @@ function createRoomMcpHandler(api, { origins = process.env.MCP_ALLOWED_ORIGINS |
     }
     const server = createRoomMcpServer(resolved.session);
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined, enableJsonResponse: true, maxRequestBodySize: 4 * 1024 * 1024
+      // Streamed (SSE) responses carry keep-alive comments every 15 s, so a
+      // long wait_for_messages call survives proxies such as Cloudflare.
+      sessionIdGenerator: undefined, enableJsonResponse: false, maxRequestBodySize: 4 * 1024 * 1024
     });
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Referrer-Policy', 'no-referrer');

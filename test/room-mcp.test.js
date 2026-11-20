@@ -192,7 +192,7 @@ test('room agents, chat and Monaco workspaces', async (t) => {
     assert.equal(context.you.actingFor.role, 'interviewee');
     assert.equal(context.question.stageId, firstStage);
     assert.ok(context.workspace.files.includes('solver/solver.go'));
-    const waiting = guestAgent.call('wait_for_messages', { afterId: context.latestMessageId, timeoutSeconds: 5 });
+    const waiting = guestAgent.call('wait_for_messages', { afterId: context.latestMessageId });
     await new Promise((resolve) => setTimeout(resolve, 100));
     guest.send({ type: 'chat_send', text: 'Can you explain solver.go?' });
     const { messages } = await waiting;
@@ -228,12 +228,28 @@ test('room agents, chat and Monaco workspaces', async (t) => {
     await guest.next('settings_updated');
     assert.equal((await rpc(`${base}/mcp/agent`, { Authorization: `Bearer ${guestAgent.token}` })).status, 403);
     assert.equal((await rpc(`${base}/mcp/agent`, { Authorization: `Bearer ${hostAgent.token}` })).status, 200);
+    // A waiting agent stays online and its wait ends as soon as access is lost.
+    const { messages: before } = await hostAgent.call('read_messages', { limit: 200 });
+    const waiting = hostAgent.client.callTool({ name: 'wait_for_messages', arguments: { afterId: before.at(-1).id } });
+    await new Promise((resolve) => setTimeout(resolve, 100)); // let the wait reach the server
+    host.send({ type: 'ai_policy_change', policy: 'off' });
+    const stopped = await waiting;
+    assert.equal(stopped.isError, true);
+    assert.match(stopped.content[0].text, /disabled AI agents/);
+    host.send({ type: 'ai_policy_change', policy: 'interviewer' });
+    await guest.next('settings_updated', (event) => event.settings.aiPolicy === 'interviewer');
     guest.send({ type: 'agent_revoke', agentId: hostAgent.agentId });
     assert.equal((await guest.next('permission_denied')).action, 'agent_revoke');
+    host.send({ type: 'ai_policy_change', policy: 'everyone' });
+    await guest.next('settings_updated', (event) => event.settings.aiPolicy === 'everyone');
+    const { messages: latest } = await guestAgent.call('read_messages', { limit: 200 });
+    const revokedWait = guestAgent.client.callTool({ name: 'wait_for_messages', arguments: { afterId: latest.at(-1).id } });
+    await new Promise((resolve) => setTimeout(resolve, 100));
     host.send({ type: 'agent_revoke', agentId: guestAgent.agentId });
     await guest.next('agents_updated', (event) => event.agents.length === 1);
-    host.send({ type: 'ai_policy_change', policy: 'everyone' });
-    await guest.next('settings_updated');
+    const revoked = await revokedWait;
+    assert.equal(revoked.isError, true);
+    assert.match(revoked.content[0].text, /revoked/);
     assert.equal((await rpc(`${base}/mcp/agent`, { Authorization: `Bearer ${guestAgent.token}` })).status, 401);
   });
 

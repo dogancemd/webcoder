@@ -179,6 +179,8 @@ function scheduleIdleCleanup(roomId) {
 const messageWaiters = new Map();
 // agentId -> last request time; agents count as online while recently active
 const agentLastSeen = new Map();
+// agentId -> number of open wait_for_messages calls; waiting agents are online
+const waitingAgents = new Map();
 
 function postMessage(roomId, message) {
   const saved = addMessage(roomId, message);
@@ -186,6 +188,23 @@ function postMessage(roomId, message) {
   if (entry) broadcast(entry, { type: 'chat_message', message: saved });
   for (const notify of messageWaiters.get(roomId) || []) notify(saved);
   return saved;
+}
+
+// Wake agents blocked in wait_for_messages so they re-check their access
+// (after a revocation, an AI policy change or a room deletion).
+function wakeWaiters(roomId) {
+  for (const notify of [...(messageWaiters.get(roomId) || [])]) notify(null);
+}
+
+// Returns why an agent can no longer use the room, or null if it still can.
+function agentAccessError(agentId) {
+  const agent = getAgent(agentId);
+  if (!agent) return 'This agent connection was revoked.';
+  const room = activeRooms.get(agent.roomId)?.data || getRoom(agent.roomId);
+  if (!room) return 'The room was deleted.';
+  const role = (getRole(agent.roomId, agent.ownerIdentity) || {}).role || 'interviewee';
+  if (!aiAllowed(room, role)) return 'The interviewer has disabled AI agents for your role in this room.';
+  return null;
 }
 
 function aiAllowed(room, role) {
@@ -201,7 +220,7 @@ function agentsSnapshot(roomId) {
     ownerId: agent.ownerIdentity,
     ownerName: agent.ownerName,
     createdAt: agent.createdAt,
-    online: now - Math.max(agent.lastSeenAt, agentLastSeen.get(agent.id) || 0) < AGENT_ONLINE_MS
+    online: waitingAgents.has(agent.id) || now - Math.max(agent.lastSeenAt, agentLastSeen.get(agent.id) || 0) < AGENT_ONLINE_MS
   }));
 }
 
@@ -382,26 +401,42 @@ function createAgentSession(agent) {
     readMessages(afterId, limit) {
       return listMessages(roomId, { afterId, limit });
     },
+    // Blocks until someone else writes. It only ends without messages when the
+    // agent can no longer use the room, the client disconnects, or an optional
+    // client-requested timeout passes.
     waitForMessages(afterId, timeoutMs, signal) {
       const pending = others(listMessages(roomId, { afterId, limit: 100 }));
       if (pending.length) return Promise.resolve(pending);
-      return new Promise((resolve) => {
+      return new Promise((resolve, reject) => {
         let waiters = messageWaiters.get(roomId);
         if (!waiters) messageWaiters.set(roomId, waiters = new Set());
-        const finish = () => {
+        const wasOnline = agentsSnapshot(roomId).find((item) => item.id === agent.id)?.online;
+        waitingAgents.set(agent.id, (waitingAgents.get(agent.id) || 0) + 1);
+        if (!wasOnline) broadcastAgents(roomId);
+        let done = false;
+        const finish = (error) => {
+          if (done) return;
+          done = true;
           clearTimeout(timer);
           waiters.delete(notify);
           if (!waiters.size) messageWaiters.delete(roomId);
-          signal?.removeEventListener('abort', finish);
+          signal?.removeEventListener('abort', onAbort);
+          const count = (waitingAgents.get(agent.id) || 1) - 1;
+          if (count) waitingAgents.set(agent.id, count); else waitingAgents.delete(agent.id);
+          if (error) return reject(new Error(error));
           markAgentSeen(agent);
           resolve(others(listMessages(roomId, { afterId, limit: 100 })));
         };
         const notify = (message) => {
-          if (message.authorId !== agent.id && message.kind !== 'activity') finish();
+          const error = agentAccessError(agent.id);
+          if (error) finish(error);
+          else if (message && message.authorId !== agent.id && message.kind !== 'activity' && message.id > afterId) finish();
         };
-        const timer = setTimeout(finish, timeoutMs);
+        const onAbort = () => finish();
+        const timer = timeoutMs ? setTimeout(() => finish(), timeoutMs) : null;
         waiters.add(notify);
-        signal?.addEventListener('abort', finish);
+        signal?.addEventListener('abort', onAbort);
+        if (signal?.aborted) onAbort();
       });
     },
     async run(stdin) {
@@ -901,6 +936,7 @@ const server = http.createServer(async (req, res) => {
         }
         destroyVSCodeSession(roomId);
         deleteRoom(roomId);
+        wakeWaiters(roomId);
         await fs.promises.rm(path.join(UPLOADS_DIR, roomId), { recursive: true, force: true });
         return sendJson(res, 200, { ok: true });
       }
@@ -1498,6 +1534,7 @@ wss.on('connection', (ws, req) => {
         broadcast(entry, { type: 'settings_updated', settings: entry.data.settings, byName: clientInfo.name });
         const labels = { off: 'disabled AI agents', interviewer: 'allowed AI agents for interviewers only', everyone: 'allowed AI agents for everyone' };
         postMessage(roomId, { kind: 'system', authorName: clientInfo.name, text: `${clientInfo.name} ${labels[msg.policy]}.` });
+        wakeWaiters(roomId);
         break;
       }
 
@@ -1531,6 +1568,7 @@ wss.on('connection', (ws, req) => {
         }
         deleteAgent(agent.id);
         agentLastSeen.delete(agent.id);
+        wakeWaiters(roomId);
         broadcastAgents(roomId);
         postMessage(roomId, { kind: 'system', authorName: clientInfo.name, text: `${clientInfo.name} revoked ${agent.label}.` });
         break;

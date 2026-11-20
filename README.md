@@ -149,7 +149,7 @@ Messages typed in the AI panel's chat reach every connected agent, and agent rep
 | --- | --- | --- |
 | `get_context` | All | Active question, code or file tree, stdin, last output, participants, agents, and latest chat message ID |
 | `send_message` / `read_messages` | All | Post to and read the room chat (Markdown supported) |
-| `wait_for_messages` | All | Wait up to 55 seconds for new messages from others after `afterId` |
+| `wait_for_messages` | All | Wait until someone else writes after `afterId`, with no polling; it ends early only with an error when the connection is revoked, AI is disabled for the owner's role, or the room is deleted. Responses stream with 15-second keep-alives, so long waits pass through proxies such as Cloudflare |
 | `run_code` | All | Run like the Run button; output is shown to everyone and returned |
 | `read_code` / `write_code` / `edit_code` | Classic | Read, replace, or search-and-replace a language buffer of the active question |
 | `list_files` / `read_file` / `write_file` / `edit_file` | Workspace | Read and change workspace files |
