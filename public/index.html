@@ -66,6 +66,7 @@
             <label for="layoutSelect">Editor Layout</label>
             <select id="layoutSelect" class="select">
               <option value="legacy" selected>Classic CoderPad (3-pane)</option>
+              <option value="workspace">Monaco Workspace (multiple files &amp; folders)</option>
               <option value="vscode-server">Real VS Code Server (code-server)</option>
             </select>
           </div>
@@ -179,6 +180,9 @@
           const liveBadge = r.activeParticipants > 0
             ? `<span class="live-pill">● ${r.activeParticipants} online</span>`
             : '';
+          const layoutBadge = r.layout === 'workspace'
+            ? `<span class="lock-pill" title="Monaco Workspace">📁 Files</span>`
+            : r.layout === 'vscode-server' ? `<span class="lock-pill" title="VS Code Server">VS Code</span>` : '';
           const lockBadge = r.isProtected
             ? `<span class="lock-pill" title="Password protected">🔒 Locked</span>`
             : '';
@@ -188,6 +192,7 @@
                 <a href="/room/${encodeURIComponent(r.id)}" class="room-item-title">
                   <span>${escapeHtml(r.title)}</span>
                   <span class="lang-tag lang-${escapeHtml(r.language)}">${langLabel}</span>
+                  ${layoutBadge}
                   ${lockBadge}
                   ${liveBadge}
                 </a>

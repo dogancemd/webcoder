@@ -1,6 +1,7 @@
 const { spawn, execFileSync } = require('node:child_process');
 const crypto = require('node:crypto');
 const { LANGUAGES } = require('./presets');
+const { languageForPath } = require('./workspace');
 
 const MAX_OUTPUT_BYTES = 128 * 1024; // 128 KB max stdout/stderr
 const MAX_CONCURRENT_RUNS = 4;
@@ -154,28 +155,117 @@ async function executeCode({ language, code, stdin = '' }) {
     };
   }
 
-  if (activeRuns >= MAX_CONCURRENT_RUNS) {
-    return {
-      ok: false,
-      exitCode: 1,
-      stdout: '',
-      stderr: 'Server is currently busy running maximum concurrent executions. Please try again in a moment.',
-      durationMs: 0,
-      timedOut: false
-    };
-  }
-
   const isCompiled = COMPILED_LANGUAGES.has(language);
-  const timeoutMs = isCompiled ? TIMEOUT_COMPILED_MS : TIMEOUT_FAST_MS;
-  const memoryLimit = isCompiled ? MEMORY_COMPILED : MEMORY_FAST;
+  const javaClassName = language === 'java' ? detectJavaClassName(code || '') : 'Solution';
+  const codeB64 = Buffer.from(String(code || ''), 'utf8').toString('base64');
+  const stdinB64 = Buffer.from(String(stdin || ''), 'utf8').toString('base64');
+  return runInSandbox({
+    language,
+    script: buildContainerScript(language, javaClassName),
+    input: `${codeB64}\n${stdinB64}\n`,
+    timeoutMs: isCompiled ? TIMEOUT_COMPILED_MS : TIMEOUT_FAST_MS,
+    memoryLimit: isCompiled ? MEMORY_COMPILED : MEMORY_FAST
+  });
+}
 
+function unavailable(stderr) {
+  return { ok: false, exitCode: 1, stdout: '', stderr, durationMs: 0, timedOut: false };
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+// Writes the JSON payload's files into /workspace/project and stdin into /tmp.
+const UNPACK_WORKSPACE = `python3 -c '
+import json, os, sys
+data = json.load(sys.stdin)
+root = "/workspace/project"
+os.makedirs(root, exist_ok=True)
+for folder in data["folders"]:
+    full = os.path.normpath(os.path.join(root, folder))
+    if not full.startswith(root + "/"): sys.exit("invalid folder path")
+    os.makedirs(full, exist_ok=True)
+for name, content in data["files"].items():
+    full = os.path.normpath(os.path.join(root, name))
+    if not full.startswith(root + "/"): sys.exit("invalid file path")
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "w", encoding="utf-8") as handle: handle.write(content)
+with open("/tmp/stdin.txt", "w", encoding="utf-8") as handle: handle.write(data["stdin"])
+' || exit 70
+mkdir -p /workspace/build
+cd /workspace/project`;
+
+function buildWorkspaceScript(language, entryFile, files) {
+  const entry = shellQuote(entryFile);
+  const entryDir = shellQuote(entryFile.includes('/') ? entryFile.slice(0, entryFile.lastIndexOf('/')) : '.');
+  const run = (command) => `${UNPACK_WORKSPACE}\n${command}`;
+  if (language === 'python') {
+    return run(`export PYTHONIOENCODING=utf-8 PYTHONDONTWRITEBYTECODE=1\nexec python3 -u ${entry} < /tmp/stdin.txt`);
+  }
+  if (language === 'javascript') {
+    return run(`export NODE_DISABLE_COLORS=1\nexec node ${entry} < /tmp/stdin.txt`);
+  }
+  if (language === 'cpp') {
+    // Compile the entry plus every other source file that does not define its own main().
+    return run(`SOURCES=(${entry})
+while IFS= read -r -d '' source; do
+  [ "$source" = ${entry} ] && continue
+  grep -qE '\\bint[[:space:]]+main[[:space:]]*\\(' "$source" || SOURCES+=("$source")
+done < <(find . -type f \\( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \\) -printf '%P\\0')
+g++ -O2 -std=c++20 -pthread -I. "\${SOURCES[@]}" -o /workspace/build/main || exit $?
+exec /workspace/build/main < /tmp/stdin.txt`);
+  }
+  if (language === 'java') {
+    const source = files[entryFile] || '';
+    const pkg = (source.match(/^\s*package\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*;/m) || [])[1];
+    const base = entryFile.slice(entryFile.lastIndexOf('/') + 1).replace(/\.java$/, '');
+    const mainClass = shellQuote(pkg ? `${pkg}.${base}` : base);
+    return run(`find . -type f -name '*.java' -exec javac -encoding UTF-8 -J-Xms32m -J-Xmx192m -d /workspace/build {} + || exit $?
+exec java -Xms16m -Xmx192m -cp /workspace/build ${mainClass} < /tmp/stdin.txt`);
+  }
+  if (language === 'go') {
+    const hasModule = Object.hasOwn(files, 'go.mod');
+    const packageDir = entryFile.includes('/') ? `./${entryFile.slice(0, entryFile.lastIndexOf('/'))}` : '.';
+    const build = hasModule
+      ? `export GO111MODULE=on GOFLAGS="-p=1 -mod=mod" GOPROXY=off\ngo build -o /workspace/build/main ${shellQuote(packageDir)} || exit $?`
+      : `export GO111MODULE=off\ncd ${entryDir} && go build -o /workspace/build/main . || exit $?`;
+    // One build job keeps the toolchain within the sandbox process limit.
+    return run(`export GOCACHE=/tmp/gocache GOPATH=/tmp/gopath GOMAXPROCS=1 GOFLAGS="-p=1"\n${build}\nunset GOMAXPROCS\nexec /workspace/build/main < /tmp/stdin.txt`);
+  }
+  if (language === 'rust') {
+    return run(`rustc --edition 2021 -O ${entry} -o /workspace/build/main || exit $?\nexec /workspace/build/main < /tmp/stdin.txt`);
+  }
+  throw new Error(`Unsupported language: ${language}`);
+}
+
+// Runs a multi-file workspace starting from workspace.entryFile.
+async function executeWorkspace({ workspace, stdin = '' }) {
+  const entryFile = workspace && workspace.entryFile;
+  const language = entryFile ? languageForPath(entryFile) : null;
+  if (!entryFile || !Object.hasOwn(workspace.files || {}, entryFile)) {
+    return unavailable('No entry file is set. Right-click a source file and choose "Set as Entry File".');
+  }
+  if (!language) return unavailable('The entry file must be a .py, .js, .cpp, .java, .go or .rs file.');
+  if (!CONTAINER_RUNTIME) return unavailable('No container runtime (podman or docker) found on host.');
+  return runInSandbox({
+    language,
+    script: buildWorkspaceScript(language, entryFile, workspace.files),
+    input: JSON.stringify({ files: workspace.files, folders: workspace.folders || [], stdin: String(stdin || '') }),
+    timeoutMs: TIMEOUT_COMPILED_MS,
+    memoryLimit: MEMORY_COMPILED,
+    workspaceSize: '160m'
+  });
+}
+
+function runInSandbox({ language, script, input, timeoutMs, memoryLimit, workspaceSize = '128m' }) {
+  if (activeRuns >= MAX_CONCURRENT_RUNS) {
+    return Promise.resolve(unavailable('Server is currently busy running maximum concurrent executions. Please try again in a moment.'));
+  }
   activeRuns++;
   const startTime = Date.now();
   const runId = crypto.randomBytes(6).toString('hex');
   const containerName = `webcoder-run-${runId}`;
-  const javaClassName = language === 'java' ? detectJavaClassName(code || '') : 'Solution';
-  const script = buildContainerScript(language, javaClassName);
-
   const args = [
     'run',
     '--rm',
@@ -189,7 +279,7 @@ async function executeCode({ language, code, stdin = '' }) {
     '--cap-drop=ALL',
     '--security-opt=no-new-privileges',
     '--read-only',
-    '--tmpfs', '/workspace:rw,exec,nosuid,size=128m',
+    '--tmpfs', `/workspace:rw,exec,nosuid,size=${workspaceSize}`,
     '--tmpfs', '/tmp:rw,nosuid,size=64m',
     SANDBOX_IMAGE,
     '/bin/bash',
@@ -284,11 +374,8 @@ async function executeCode({ language, code, stdin = '' }) {
       finalize(code);
     });
 
-    // Write base64-encoded code and stdin lines to container stdin
-    const codeB64 = Buffer.from(String(code || ''), 'utf8').toString('base64');
-    const stdinB64 = Buffer.from(String(stdin || ''), 'utf8').toString('base64');
     try {
-      child.stdin.write(`${codeB64}\n${stdinB64}\n`);
+      child.stdin.write(input);
       child.stdin.end();
     } catch {
       // ignore EPIPE if container exited early
@@ -296,8 +383,11 @@ async function executeCode({ language, code, stdin = '' }) {
   });
 }
 
+
 module.exports = {
   executeCode,
+  executeWorkspace,
+  buildWorkspaceScript,
   CONTAINER_RUNTIME,
   SANDBOX_IMAGE
 };

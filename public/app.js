@@ -97,6 +97,15 @@
   const stdinTextarea = $('stdinTextarea');
   const toastEl = $('toast');
   const remoteCursorStyles = $('remoteCursorStyles');
+  const languagePicker = $('languagePicker');
+  const toggleExplorerBtn = $('toggleExplorerBtn');
+  const wsExplorer = $('wsExplorer');
+  const wsTabs = $('wsTabs');
+  const outputTab = $('outputTab');
+  const aiTab = $('aiTab');
+  const aiUnread = $('aiUnread');
+  const outputView = $('outputView');
+  const aiPanelEl = $('aiPanel');
 
   let ws = null;
   let selfId = null;
@@ -105,7 +114,9 @@
   let codes = { python: '', cpp: '', java: '', rust: '', go: '', javascript: '' };
   let participants = [];
   let remoteCursors = new Map();
-  let decorationIds = [];
+  let cursorDecorations = null;
+  let isWorkspace = false;
+  let workspaceCtl = null;
   let editor = null;
   let fallbackTextarea = null;
   let suppressEditorChange = false;
@@ -134,6 +145,42 @@
   }
 
   const { renderMarkdown } = window.WebCoderMarkdown;
+
+  const aiPanel = window.WebCoderAI.createAiPanel({
+    sendWs: (payload) => sendWs(payload),
+    showToast,
+    renderMarkdown,
+    onUnreadChange(count) {
+      aiUnread.hidden = count === 0;
+      aiUnread.textContent = count > 99 ? '99+' : String(count);
+    }
+  });
+
+  // Monaco Workspace rooms replace the per-language buffer with a file tree.
+  function enableWorkspaceMode() {
+    if (workspaceCtl) return;
+    isWorkspace = true;
+    document.body.classList.add('workspace-mode');
+    languagePicker.hidden = true;
+    wsExplorer.hidden = false;
+    wsTabs.hidden = false;
+    toggleExplorerBtn.hidden = false;
+    resetTemplateBtn.textContent = 'Reset Workspace';
+    resetTemplateBtn.title = 'Replace this stage\'s files with the starter project';
+    workspaceCtl = window.WebCoderWorkspace.createWorkspaceController({
+      explorerEl: wsExplorer,
+      tabsEl: wsTabs,
+      sendWs: (payload) => sendWs(payload),
+      showToast,
+      onActiveFileChange(path, entryFile) {
+        fileNameLabel.textContent = path || 'No file open';
+        fileNameLabel.title = entryFile ? `Run starts from ${entryFile}` : 'No entry file set';
+        runBtnLabel.textContent = isRunning ? 'Running...' : (entryFile ? `Run ${entryFile.slice(entryFile.lastIndexOf('/') + 1)}` : 'Run Code');
+        renderRemoteCursors();
+      }
+    });
+    if (editor) workspaceCtl.attach(editor, window.monaco);
+  }
 
   function updateImageControls() {
     const isInterviewer = selfRole === 'interviewer';
@@ -220,6 +267,7 @@
   }
 
   function flushCodeChange() {
+    if (workspaceCtl) workspaceCtl.flush();
     clearTimeout(codeDebounce);
     codeDebounce = null;
     if (!pendingCodeChange) return;
@@ -234,6 +282,7 @@
   }
 
   function setEditorValue(newCode, lang = currentLanguage) {
+    if (isWorkspace) return;
     suppressEditorChange = true;
     try {
       if (editor) {
@@ -243,10 +292,7 @@
           model = window.monaco.editor.createModel(newCode, getMonacoLang(lang));
           editorModels.set(key, model);
         }
-        if (editor.getModel() !== model) {
-          decorationIds = editor.deltaDecorations(decorationIds, []);
-          editor.setModel(model);
-        }
+        if (editor.getModel() !== model) editor.setModel(model);
         if (window.monaco && model) window.monaco.editor.setModelLanguage(model, getMonacoLang(lang));
         if (editor.getValue() !== newCode) {
           const pos = editor.getPosition();
@@ -291,11 +337,13 @@
           bracketPairColorization: { enabled: true }
         });
         editor.addCommand(window.monaco.KeyMod.CtrlCmd | window.monaco.KeyCode.Enter, () => triggerRunCode());
+        cursorDecorations = editor.createDecorationsCollection();
+        if (workspaceCtl) workspaceCtl.attach(editor, window.monaco);
 
         // Keep each stage/language in its own model, including its undo history.
         editorModels.set(`${activeStageId || 'loading'}:${currentLanguage}`, editor.getModel());
         editor.onDidChangeModelContent(() => {
-          if (suppressEditorChange) return;
+          if (suppressEditorChange || isWorkspace) return;
           const val = editor.getValue();
           const language = currentLanguage;
           codes[language] = val;
@@ -316,6 +364,7 @@
           cursorDebounce = setTimeout(() => {
             sendWs({
               type: 'cursor_change', stageId, language,
+              path: workspaceCtl ? workspaceCtl.activePath() : undefined,
               position: e.selection.getPosition(),
               selection: {
                 startLineNumber: e.selection.startLineNumber, startColumn: e.selection.startColumn,
@@ -346,7 +395,8 @@
     const newDecorations = [];
     for (const [uid, info] of remoteCursors.entries()) {
       if (uid === selfId) continue;
-      if (!info.cursor || info.cursor.language !== currentLanguage) continue;
+      if (!info.cursor) continue;
+      if (isWorkspace ? info.cursor.path !== workspaceCtl.activePath() : info.cursor.language !== currentLanguage) continue;
       if (info.cursor.stageId && info.cursor.stageId !== activeStageId) continue;
       const safeUid = uid.replace(/[^a-zA-Z0-9]/g, '');
       const color = info.color || '#38bdf8';
@@ -368,7 +418,7 @@
       }
     }
     remoteCursorStyles.textContent = dynamicCss;
-    decorationIds = editor.deltaDecorations(decorationIds, newDecorations);
+    if (cursorDecorations) cursorDecorations.set(newDecorations);
   }
 
   function updateRoleBadge() {
@@ -437,6 +487,7 @@
     updateLockButton();
     updateClaimButton();
     renderParticipants();
+    aiPanel.setSelf(selfId, selfRole);
   }
 
   function renderParticipants() {
@@ -497,7 +548,8 @@
       `;
     } else {
       runBtnIcon.textContent = '▶';
-      runBtnLabel.textContent = 'Run Code';
+      const entryFile = workspaceCtl && workspaceCtl.entryFile();
+      runBtnLabel.textContent = entryFile ? `Run ${entryFile.slice(entryFile.lastIndexOf('/') + 1)}` : 'Run Code';
     }
   }
 
@@ -520,7 +572,7 @@
     outputScroll.innerHTML = `
       <div class="output-meta">
         <span class="status-badge ${statusClass}">${result.ok ? '✓' : '✕'} ${escapeHtml(statusLabel)} • ${Number(result.durationMs || 0)} ms</span>
-        <span style="color: var(--text-secondary);">Ran by <strong>${escapeHtml(result.triggeredBy || 'Participant')}</strong></span>
+        <span style="color: var(--text-secondary);">${result.entryFile ? `<code>${escapeHtml(result.entryFile)}</code> · ` : ''}Ran by <strong>${escapeHtml(result.triggeredBy || 'Participant')}</strong></span>
       </div>
       ${stdoutHtml}${stderrHtml}${emptyNotice}
     `;
@@ -529,6 +581,10 @@
   function triggerRunCode() {
     if (isRunning) return;
     flushCodeChange();
+    if (isWorkspace) {
+      sendWs({ type: 'run_code', stdin: stdinTextarea.value });
+      return;
+    }
     const currentCode = getEditorValue();
     codes[currentLanguage] = currentCode;
     sendWs({ type: 'run_code', language: currentLanguage, code: currentCode, stdin: stdinTextarea.value });
@@ -564,6 +620,7 @@
     ws.addEventListener('message', (event) => {
       let msg;
       try { msg = JSON.parse(event.data); } catch { return; }
+      if (aiPanel.handle(msg)) return;
 
       switch (msg.type) {
         case 'init': {
@@ -586,8 +643,13 @@
           fileNameLabel.textContent = getFileNameForLang(currentLanguage);
           stdinTextarea.value = room.stdin || '';
 
+          if (room.layout === 'workspace') {
+            enableWorkspaceMode();
+            workspaceCtl.load(room.activeStageId, room.workspace);
+          }
           setEditorValue(codes[currentLanguage] || '', currentLanguage);
           updatePromptUI(room.promptMarkdown || '', true);
+          aiPanel.init(msg);
 
           participants = msg.participants || [];
           remoteCursors.clear();
@@ -645,7 +707,19 @@
           showToast(msg.message || 'Only the interviewer can perform this action.');
           break;
 
+        case 'file_update': if (workspaceCtl) workspaceCtl.applyFileUpdate(msg); break;
+        case 'workspace_op': if (workspaceCtl) workspaceCtl.applyOp(msg, selfId); break;
+        case 'workspace_state':
+          if (workspaceCtl && msg.stageId === activeStageId) {
+            const stage = stages.find((item) => item.id === msg.stageId);
+            if (stage) stage.workspace = msg.workspace;
+            workspaceCtl.load(msg.stageId, msg.workspace);
+            if (msg.senderName) showToast(`${msg.senderName} replaced the workspace files.`);
+          }
+          break;
+
         case 'code_update': {
+          if (isWorkspace) break;
           const stage = stages.find((item) => item.id === msg.stageId);
           if (stage && stage.codes) stage.codes[msg.language] = msg.code;
           if (msg.stageId && msg.stageId !== activeStageId) break;
@@ -660,7 +734,7 @@
           break;
 
         case 'language_update': {
-          if (msg.stageId && msg.stageId !== activeStageId) break;
+          if (isWorkspace || (msg.stageId && msg.stageId !== activeStageId)) break;
           currentLanguage = msg.language;
           codes[currentLanguage] = msg.code;
           languageSelect.value = currentLanguage;
@@ -685,6 +759,7 @@
             const stage = stages.find((item) => item.id === activeStageId);
             updatePromptUI(stage ? stage.promptMarkdown : '', true);
             codes = stage ? stage.codes : {};
+            if (workspaceCtl) workspaceCtl.load(activeStageId, stage && stage.workspace);
             setEditorValue(codes[currentLanguage] || '', currentLanguage);
             remoteCursors.clear();
             renderRemoteCursors();
@@ -860,7 +935,10 @@
   });
 
   resetTemplateBtn.addEventListener('click', () => {
-    if (!confirm(`Reset ${langMeta(currentLanguage).label} code to default starter template?`)) return;
+    const question = isWorkspace
+      ? 'Replace ALL files of this stage with the starter project? Current files will be lost.'
+      : `Reset ${langMeta(currentLanguage).label} code to default starter template?`;
+    if (!confirm(question)) return;
     flushCodeChange();
     sendWs({ type: 'reset_template' });
   });
@@ -938,6 +1016,25 @@
     setPaneCollapsed(side, !pane.classList.contains('collapsed'));
   }
   togglePromptBtn.addEventListener('click', () => togglePane('left'));
+  toggleExplorerBtn.addEventListener('click', () => {
+    wsExplorer.hidden = !wsExplorer.hidden;
+    toggleExplorerBtn.classList.toggle('active', !wsExplorer.hidden);
+    if (editor) editor.layout();
+  });
+
+  // Output / AI tabs in the right pane
+  function showRightTab(tab) {
+    const ai = tab === 'ai';
+    outputTab.classList.toggle('active', !ai);
+    aiTab.classList.toggle('active', ai);
+    outputView.hidden = ai;
+    aiPanelEl.hidden = !ai;
+    clearOutputBtn.hidden = ai;
+    aiPanel.setVisible(ai);
+    if (ai && outputPane.classList.contains('collapsed')) setPaneCollapsed('right', false);
+  }
+  outputTab.addEventListener('click', () => showRightTab('output'));
+  aiTab.addEventListener('click', () => showRightTab('ai'));
   toggleOutputBtn.addEventListener('click', () => togglePane('right'));
   collapsePromptBtn.addEventListener('click', () => setPaneCollapsed('left', true));
   collapseOutputBtn.addEventListener('click', () => setPaneCollapsed('right', true));

@@ -104,7 +104,7 @@
     <section class="legacy-pane legacy-pane-editor" id="editorPane">
       <div class="pane-header">
         <div class="pane-title">
-          <div class="language-picker">
+          <div class="language-picker" id="languagePicker">
             <label for="languageSelect">Language</label>
             <select id="languageSelect" class="lang-select" title="Switch Room Language" aria-describedby="fileNameLabel">
               <option value="python">Python 3 (3.11)</option>
@@ -119,6 +119,7 @@
           <span id="syncIndicator" style="font-size: 11px; color: #2fbf8f; text-transform: none; font-weight: 500;">● Live</span>
         </div>
         <div class="pane-actions">
+          <button type="button" class="btn btn-subtle" id="toggleExplorerBtn" hidden title="Show/Hide file explorer">☰ Files</button>
           <button type="button" class="btn btn-subtle" id="resetTemplateBtn" style="padding: 3px 8px; font-size: 11.5px;">Reset Starter Code</button>
           <select id="fontSizeSelect" class="mini-select" title="Editor Font Size">
             <option value="13">13px</option>
@@ -128,7 +129,24 @@
           </select>
         </div>
       </div>
-      <div id="editorContainer" class="editor-container"></div>
+      <div class="editor-split">
+        <aside id="wsExplorer" class="ws-explorer" hidden aria-label="Workspace files">
+          <div class="ws-explorer-head">
+            <span>Files</span>
+            <div class="ws-explorer-actions">
+              <button type="button" data-action="new-file" title="New file">+ File</button>
+              <button type="button" data-action="new-folder" title="New folder">+ Folder</button>
+              <button type="button" data-action="collapse" title="Collapse all folders">⊟</button>
+            </div>
+          </div>
+          <div class="ws-tree" role="tree"></div>
+          <div class="ws-explorer-foot">Right-click for more · drag to move</div>
+        </aside>
+        <div class="editor-main">
+          <div id="wsTabs" class="ws-tabs" hidden></div>
+          <div id="editorContainer" class="editor-container"></div>
+        </div>
+      </div>
     </section>
 
     <div class="resizer-v" id="resizerRight"></div>
@@ -136,13 +154,17 @@
     <!-- Right Pane: Execution Output + Stdin -->
     <section class="legacy-pane legacy-pane-output" id="outputPane">
       <div class="pane-header">
-        <div class="pane-title">Program Output</div>
+        <div class="pane-title">
+          <button type="button" class="tab-btn active" id="outputTab">Output</button>
+          <button type="button" class="tab-btn" id="aiTab" title="Chat with the room and connected AI agents">AI <span id="aiUnread" class="ai-unread" hidden></span></button>
+        </div>
         <div class="pane-actions">
           <button type="button" class="btn btn-subtle" id="clearOutputBtn" style="padding: 3px 8px; font-size: 11.5px;">Clear</button>
           <button type="button" class="btn btn-subtle pane-collapse-btn" id="collapseOutputBtn" title="Collapse this panel">&raquo;</button>
         </div>
       </div>
 
+      <div id="outputView" class="output-view">
       <div id="outputScroll" class="output-scroll">
         <div class="output-placeholder">
           <div style="font-size: 22px; opacity: 0.5;">▶</div>
@@ -158,13 +180,54 @@
         </div>
         <textarea id="stdinTextarea" class="stdin-textarea" placeholder="Optional input passed to stdin (sys.stdin / std::cin / Scanner / process.stdin)..."></textarea>
       </div>
+      </div>
+
+      <div id="aiPanel" class="ai-panel" hidden>
+        <div class="ai-agents">
+          <div class="ai-agents-head">
+            <span class="ai-heading">AI agents</span>
+            <select id="aiPolicySelect" class="mini-select" title="Who may connect AI agents" hidden>
+              <option value="off">Off</option>
+              <option value="interviewer">Interviewers only</option>
+              <option value="everyone">Everyone (AI-enabled)</option>
+            </select>
+          </div>
+          <div id="aiPolicyLabel" class="ai-policy-label"></div>
+          <div id="aiAgentList" class="ai-agent-list"></div>
+          <button type="button" class="btn btn-subtle ai-connect-btn" id="aiConnectBtn">+ Connect your Claude</button>
+        </div>
+        <div id="aiMessages" class="ai-messages" aria-live="polite"></div>
+        <form id="aiChatForm" class="ai-chat-form">
+          <textarea id="aiChatInput" rows="2" maxlength="8000" placeholder="Message the room and its agents (Enter to send, Shift+Enter for a new line)"></textarea>
+          <button type="submit" class="btn btn-primary">Send</button>
+        </form>
+      </div>
     </section>
   </main>
+
+  <dialog id="aiConnectDialog" class="ai-dialog">
+    <div class="ai-dialog-head">
+      <strong>Connect your Claude to this room</strong>
+      <button type="button" class="btn btn-subtle" data-close>✕</button>
+    </div>
+    <form id="aiConnectCreate" class="ai-dialog-body" method="dialog">
+      <p>Create a private MCP connection for Claude Code, Claude Desktop, claude.ai or another MCP client. The agent can read the question and code, edit files, run code and chat here, with your permissions. Everyone in the room sees what it does.</p>
+      <label for="aiAgentLabelInput">Agent name</label>
+      <input id="aiAgentLabelInput" class="input" maxlength="40" placeholder="e.g. Alex's Claude Code" />
+      <div class="ai-dialog-actions">
+        <button type="button" class="btn btn-subtle" data-close>Cancel</button>
+        <button type="submit" class="btn btn-primary" id="aiConnectSubmit">Create connection</button>
+      </div>
+    </form>
+    <div id="aiConnectResult" class="ai-dialog-body" hidden></div>
+  </dialog>
 
   <div id="toast" class="toast"></div>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs/loader.min.js"></script>
   <script src="/markdown.js"></script>
+  <script src="/workspace.js"></script>
+  <script src="/ai-panel.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>
