@@ -5,6 +5,12 @@ const { DatabaseSync } = require('node:sqlite');
 const { getPresetById, LANGUAGES } = require('./presets');
 const { hashPassword } = require('./auth');
 const { createStage, getStageState } = require('./stages');
+const { sanitizeWorkspace, starterWorkspace, presetWorkspace } = require('./workspace');
+
+const LAYOUTS = ['legacy', 'vscode-server', 'workspace'];
+const AI_POLICIES = ['off', 'interviewer', 'everyone'];
+const DEFAULT_SETTINGS = { aiPolicy: 'interviewer' };
+const MAX_MESSAGES_PER_ROOM = 2000;
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
 if (!fs.existsSync(DATA_DIR)) {
@@ -46,6 +52,29 @@ db.exec(`
     PRIMARY KEY (room_id, identity_id)
   );
 
+  CREATE TABLE IF NOT EXISTS room_agents (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    owner_identity TEXT NOT NULL,
+    owner_name TEXT NOT NULL DEFAULT '',
+    label TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE INDEX IF NOT EXISTS room_agents_room ON room_agents (room_id);
+
+  CREATE TABLE IF NOT EXISTS room_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    author_id TEXT NOT NULL DEFAULT '',
+    author_name TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS room_messages_room ON room_messages (room_id, id);
+
   CREATE TABLE IF NOT EXISTS app_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -62,9 +91,12 @@ for (const col of ['code_rust', 'code_go', 'code_javascript', 'layout', 'passwor
 if (!existingCols.includes('stages_json')) {
   db.exec("ALTER TABLE rooms ADD COLUMN stages_json TEXT NOT NULL DEFAULT 'null'");
 }
+if (!existingCols.includes('settings_json')) {
+  db.exec("ALTER TABLE rooms ADD COLUMN settings_json TEXT NOT NULL DEFAULT '{}'");
+}
 
-// Retire the custom VS Code layout without changing saved room content.
-db.exec("UPDATE rooms SET layout = 'legacy' WHERE layout != 'vscode-server' AND layout != 'legacy'");
+// Retire unknown (older custom) layouts without changing saved room content.
+db.exec("UPDATE rooms SET layout = 'legacy' WHERE layout NOT IN ('vscode-server', 'legacy', 'workspace')");
 
 const stmts = {
   getRoom: db.prepare('SELECT * FROM rooms WHERE id = ?'),
@@ -88,17 +120,46 @@ const stmts = {
         stdin = ?,
         last_output_json = ?,
         stages_json = ?,
+        settings_json = ?,
         updated_at = ?
     WHERE id = ?
   `),
   listRecentRooms: db.prepare(`
-    SELECT id, title, language, created_at, updated_at, (password_hash != '') AS is_protected
+    SELECT id, title, language, layout, created_at, updated_at, (password_hash != '') AS is_protected
     FROM rooms
     ORDER BY updated_at DESC
     LIMIT ?
   `),
   deleteRoom: db.prepare('DELETE FROM rooms WHERE id = ?'),
   deleteRoomRoles: db.prepare('DELETE FROM room_roles WHERE room_id = ?'),
+  deleteRoomAgents: db.prepare('DELETE FROM room_agents WHERE room_id = ?'),
+  deleteRoomMessages: db.prepare('DELETE FROM room_messages WHERE room_id = ?'),
+  setStagesJson: db.prepare('UPDATE rooms SET stages_json = ? WHERE id = ?'),
+
+  insertAgent: db.prepare(`
+    INSERT INTO room_agents (id, room_id, token_hash, owner_identity, owner_name, label, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `),
+  getAgent: db.prepare('SELECT * FROM room_agents WHERE id = ?'),
+  listAgents: db.prepare('SELECT * FROM room_agents WHERE room_id = ? ORDER BY created_at'),
+  deleteAgent: db.prepare('DELETE FROM room_agents WHERE id = ?'),
+  touchAgent: db.prepare('UPDATE room_agents SET last_seen_at = ? WHERE id = ?'),
+
+  insertMessage: db.prepare(`
+    INSERT INTO room_messages (room_id, kind, author_id, author_name, text, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `),
+  listMessagesAfter: db.prepare(`
+    SELECT * FROM room_messages WHERE room_id = ? AND id > ? ORDER BY id LIMIT ?
+  `),
+  listRecentMessages: db.prepare(`
+    SELECT * FROM (SELECT * FROM room_messages WHERE room_id = ? ORDER BY id DESC LIMIT ?) ORDER BY id
+  `),
+  pruneMessages: db.prepare(`
+    DELETE FROM room_messages WHERE room_id = ? AND id <= (
+      SELECT id FROM room_messages WHERE room_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?
+    )
+  `),
 
   getRoomPasswordHash: db.prepare('SELECT password_hash FROM rooms WHERE id = ?'),
   setRoomPassword: db.prepare('UPDATE rooms SET password_hash = ? WHERE id = ?'),
@@ -169,22 +230,44 @@ function hydrateRoomRow(row) {
       migratedStages = true;
     }
   }
-  if (migratedStages) {
-    db.prepare('UPDATE rooms SET stages_json = ? WHERE id = ?').run(JSON.stringify(stageState), row.id);
+  const layout = LAYOUTS.includes(row.layout) ? row.layout : 'legacy';
+  if (layout === 'workspace') {
+    for (const stage of stageState.stages) {
+      if (!stage.workspace) {
+        stage.workspace = starterWorkspace(row.language);
+        migratedStages = true;
+      } else {
+        stage.workspace = sanitizeWorkspace(stage.workspace);
+      }
+    }
   }
+  if (migratedStages) {
+    stmts.setStagesJson.run(JSON.stringify(stageState), row.id);
+  }
+  let settings = {};
+  try { settings = JSON.parse(row.settings_json || '{}') || {}; } catch {}
+  const activeStage = stageState.stages.find((stage) => stage.id === stageState.activeStageId) || stageState.stages[0];
   return {
     id: row.id,
     title: row.title,
     language: row.language,
-    layout: row.layout === 'vscode-server' ? 'vscode-server' : 'legacy',
+    layout,
     isProtected: Boolean(row.password_hash),
-    codes: stageState.stages.find((stage) => stage.id === stageState.activeStageId)?.codes || codes,
+    codes: activeStage?.codes || codes,
     promptMarkdown: row.prompt_markdown,
     ...stageState,
+    ...(layout === 'workspace' ? { workspace: activeStage.workspace } : {}),
+    settings: normalizeSettings(settings),
     stdin: row.stdin || '',
     lastOutput,
     createdAt: row.created_at,
     updatedAt: row.updated_at
+  };
+}
+
+function normalizeSettings(settings = {}) {
+  return {
+    aiPolicy: AI_POLICIES.includes(settings.aiPolicy) ? settings.aiPolicy : DEFAULT_SETTINGS.aiPolicy
   };
 }
 
@@ -195,7 +278,7 @@ function createRoom({ id, title, language = 'python', layout = 'legacy', presetI
 
   const preset = getPresetById(presetId);
   const validLang = LANGUAGES.includes(language) ? language : 'python';
-  const validLayout = layout === 'vscode-server' ? 'vscode-server' : 'legacy';
+  const validLayout = LAYOUTS.includes(layout) ? layout : 'legacy';
   const roomTitle = (title && String(title).trim()) || `${preset.title} Interview`;
   const passwordHash = password ? hashPassword(String(password)) : '';
   const now = Date.now();
@@ -218,6 +301,10 @@ function createRoom({ id, title, language = 'python', layout = 'legacy', presetI
     now,
     now
   );
+  if (validLayout === 'workspace') {
+    const stage = createStage('Stage 1', preset.prompt, preset.templates, presetWorkspace(preset, validLang));
+    stmts.setStagesJson.run(JSON.stringify({ stages: [stage], activeStageId: stage.id }), roomId);
+  }
 
   return getRoom(roomId);
 }
@@ -251,6 +338,7 @@ function saveRoomState(room) {
     room.stdin || '',
     JSON.stringify(room.lastOutput || null),
     JSON.stringify(getStageState(room)),
+    JSON.stringify(normalizeSettings(room.settings)),
     now,
     room.id
   );
@@ -262,6 +350,7 @@ function listRecentRooms(limit = 20) {
     id: r.id,
     title: r.title,
     language: r.language,
+    layout: r.layout,
     isProtected: Boolean(r.is_protected),
     createdAt: r.created_at,
     updatedAt: r.updated_at
@@ -325,6 +414,70 @@ function hasRole(roomId, role) {
 function deleteRoom(id) {
   stmts.deleteRoom.run(id);
   stmts.deleteRoomRoles.run(id);
+  stmts.deleteRoomAgents.run(id);
+  stmts.deleteRoomMessages.run(id);
+}
+
+// ---- Room-scoped AI agents and chat ----
+
+function hydrateAgent(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    roomId: row.room_id,
+    tokenHash: row.token_hash,
+    ownerIdentity: row.owner_identity,
+    ownerName: row.owner_name,
+    label: row.label,
+    createdAt: row.created_at,
+    lastSeenAt: row.last_seen_at
+  };
+}
+
+function createAgent({ id, roomId, tokenHash, ownerIdentity, ownerName, label }) {
+  stmts.insertAgent.run(id, roomId, tokenHash, ownerIdentity, ownerName || '', label, Date.now());
+  return getAgent(id);
+}
+
+function getAgent(id) {
+  return hydrateAgent(stmts.getAgent.get(id));
+}
+
+function listAgents(roomId) {
+  return stmts.listAgents.all(roomId).map(hydrateAgent);
+}
+
+function deleteAgent(id) {
+  stmts.deleteAgent.run(id);
+}
+
+function touchAgent(id, at = Date.now()) {
+  stmts.touchAgent.run(at, id);
+}
+
+function hydrateMessage(row) {
+  return {
+    id: Number(row.id),
+    kind: row.kind,
+    authorId: row.author_id,
+    authorName: row.author_name,
+    text: row.text,
+    createdAt: row.created_at
+  };
+}
+
+function addMessage(roomId, { kind, authorId = '', authorName, text }) {
+  const result = stmts.insertMessage.run(roomId, kind, authorId, authorName, text, Date.now());
+  const id = Number(result.lastInsertRowid);
+  if (id % 50 === 0) stmts.pruneMessages.run(roomId, roomId, MAX_MESSAGES_PER_ROOM);
+  return hydrateMessage({
+    id, kind, author_id: authorId, author_name: authorName, text, created_at: Date.now()
+  });
+}
+
+function listMessages(roomId, { afterId = 0, limit = 200 } = {}) {
+  if (afterId > 0) return stmts.listMessagesAfter.all(roomId, afterId, limit).map(hydrateMessage);
+  return stmts.listRecentMessages.all(roomId, limit).map(hydrateMessage);
 }
 
 module.exports = {
@@ -340,5 +493,14 @@ module.exports = {
   getRole,
   setRole,
   listRoles,
-  hasRole
+  hasRole,
+  normalizeSettings,
+  AI_POLICIES,
+  createAgent,
+  getAgent,
+  listAgents,
+  deleteAgent,
+  touchAgent,
+  addMessage,
+  listMessages
 };

@@ -11,7 +11,7 @@
       .replace(/\*([^*]+)\*/g, '<em>$1</em>');
   }
 
-  function formatInline(text) {
+  function formatInline(text, options = {}) {
     const tokens = /`([^`]+)`|!\[([^\]\n]*)\]\(\s*(<[^<>\n]+>|[^\s)]+)(?:\s+"([^"\n]*)")?\s*\)/g;
     let html = '';
     let offset = 0;
@@ -26,6 +26,7 @@
           const url = new URL(source, 'https://webcoder.invalid');
           allowed = url.protocol === 'https:' || url.protocol === 'http:';
         } catch {}
+        if (options.images === false) allowed = false;
         html += allowed
           ? `<img src="${escapeHtml(source)}" alt="${escapeHtml(match[2])}"${match[4] ? ` title="${escapeHtml(match[4])}"` : ''} loading="lazy" decoding="async" referrerpolicy="no-referrer" />`
           : escapeHtml(match[0]);
@@ -35,7 +36,8 @@
     return html + formatText(text.slice(offset));
   }
 
-  function renderMarkdown(md) {
+  function renderMarkdown(md, options = {}) {
+    const inline = (text) => formatInline(text, options);
     let html = '';
     let inCodeBlock = false;
     let codeBlockLines = [];
@@ -56,13 +58,13 @@
       if (heading) {
         closeList();
         const level = heading[1].length;
-        html += `<h${level}>${formatInline(heading[2])}</h${level}>`;
+        html += `<h${level}>${inline(heading[2])}</h${level}>`;
       } else if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
         if (!inList) { html += '<ul>'; inList = true; }
-        html += `<li>${formatInline(trimmed.slice(2))}</li>`;
+        html += `<li>${inline(trimmed.slice(2))}</li>`;
       } else {
         closeList();
-        html += `<p>${formatInline(trimmed)}</p>`;
+        html += `<p>${inline(trimmed)}</p>`;
       }
     }
     closeList();

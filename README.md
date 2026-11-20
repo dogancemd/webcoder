@@ -16,7 +16,9 @@ The project aims to make technical interviews easy to host on your own infrastru
 - **Multi-stage interviews:** CoderPad rooms support up to 20 named stages, each with its own saved problem prompt and code buffers for every language. New stages start with fresh starter code, and switching back restores that stage's code. Only interviewers can add, rename, remove, or switch stages. Everyone follows the active stage in real time; the selected language, stdin, output, and timer are shared across stages. Existing rooms retain their code when upgraded.
 - **Optional room passwords:** protect room pages, live state, API data, and the VS Code workspace. Browser unlocks last 24 hours; changing the password invalidates existing unlocks and invite links. **Copy Invite Link** embeds a signed token so invitees join without typing the password.
 - **Interviewer controls:** manage the prompt, load presets, rename the room, reset starter code, control the timer, and promote or demote participants. Everyone can edit and run code. If no interviewer is currently present, any participant can use **Become Interviewer** to take over.
-- **AI agent tools:** an optional authenticated MCP endpoint lets agents create rooms and add, edit, reorder, switch, or delete questions, with live updates for participants.
+- **Monaco Workspace:** a multi-file editor with folders, tabs, drag-and-drop moves, live collaboration, and per-stage file trees. Runs build the whole project in the sandbox from a chosen entry file.
+- **Bring-your-own AI agents:** participants can connect their own Claude Code, Claude Desktop, claude.ai, or other MCP client to a room. Agents chat with people in the room's AI panel, read the question and code, edit files, and run code, all visible to everyone. The interviewer decides who may connect agents, enabling AI-enabled interviews.
+- **Administrator MCP tools:** an optional authenticated MCP endpoint lets agents create rooms and add, edit, reorder, switch, or delete questions, with live updates for participants.
 - **Persistent rooms:** SQLite stores room content and browser-linked participant roles across server restarts. VS Code files live in a persistent container volume.
 - **Container-based execution:** classic-editor runs use temporary containers with resource limits and no network access.
 
@@ -27,13 +29,14 @@ Choose a layout when creating a room:
 | Layout | Experience | Best suited to |
 | --- | --- | --- |
 | **Classic CoderPad** | Resizable problem, Monaco editor, and output/input panels with live collaboration | Focused coding questions and algorithm interviews |
+| **Monaco Workspace** | The classic panels plus a file explorer with folders and editor tabs; no extra container needed | Multi-file exercises such as small projects, refactoring, and code reading |
 | **Real VS Code Server** | OpenVSCode Server in a per-room container, with a terminal, language tools, and a persistent project folder | Exercises involving multiple files and a fuller development environment |
 
 The VS Code workspace starts with an empty `/home/workspace/interview` folder. Its image includes Python/Pyright, C/C++ clangd, Java support, Go tools, Rust Analyzer, and Prettier, alongside built-in JavaScript/TypeScript support. The classic editor's synchronized buffers and interview panels are a separate experience from the VS Code workspace.
 
 ### Supported languages
 
-The classic editor compiles or runs code using the tools installed in the sandbox image:
+The classic editor and Monaco Workspace compile or run code using the tools installed in the sandbox image:
 
 | Language | Execution |
 | --- | --- |
@@ -45,6 +48,24 @@ The classic editor compiles or runs code using the tools installed in the sandbo
 | Rust | `rustc` with edition 2021 |
 
 The sandbox uses Debian Bookworm packages; exact runtime versions depend on the built image. Runs have no network access, so dependencies must already be available inside the image.
+
+### Monaco Workspace
+
+Choose **Monaco Workspace** as the layout when creating a room. A blank room starts with a small multi-file project in the selected language; a problem preset starts with that preset's starter file. Each stage has its own file tree, so moving to another question gives everyone a fresh project and returning restores the earlier files.
+
+- Use **+ File** and **+ Folder**, or right-click the explorer for New File, New Folder, Rename / Move, Delete, and **Set as Entry File**. Type paths such as `src/util/math.py` to create folders on the way. Drag files or folders onto another folder to move them.
+- Everyone can edit files and run code; edits, file operations, and cursors synchronize live. **Reset Workspace** (interviewer only) replaces the stage's files with the starter project.
+- **Run** copies the workspace into a fresh sandbox and starts from the entry file (marked ▶):
+
+| Entry file | Build and run |
+| --- | --- |
+| `.py` / `.js` | Runs the entry file from the project root, so imports of other project files work |
+| `.cpp` / `.cc` / `.cxx` | Compiles the entry file plus every other C++ source that does not define its own `main()`; includes resolve from the project root |
+| `.java` | Compiles all `.java` files and runs the entry file's class, including its `package` |
+| `.go` | Builds the entry file's package; with a root `go.mod`, module-local imports work (no downloads) |
+| `.rs` | Compiles the entry file with `rustc`; `mod` declarations load sibling files |
+
+Workspaces are limited to 200 files, 200 folders, 8 nesting levels, 512 KiB per file, and 4 MiB in total. Runs use the compiled-language limits below.
 
 ## Quick start
 
@@ -95,7 +116,7 @@ Set environment variables when starting the server:
 | `PORT` | `3000` | HTTP port |
 | `SANDBOX_IMAGE` | `webcoder-sandbox:latest` | Image used for classic-editor code execution |
 | `MCP_TOKEN` | unset (disabled) | Bearer token granting administrator access to MCP room and question tools |
-| `MCP_ALLOWED_ORIGINS` | empty | Comma-separated browser Origin values allowed on authenticated MCP requests; requests without Origin are accepted |
+| `MCP_ALLOWED_ORIGINS` | empty | Comma-separated browser Origin values allowed on authenticated MCP requests (administrator and room agent endpoints); requests without Origin are accepted |
 | `VSCODE_IMAGE` | `webcoder-vscode:latest` | Image used for VS Code room containers |
 
 For example, to listen locally on a different port:
@@ -104,7 +125,38 @@ For example, to listen locally on a different port:
 HOST=127.0.0.1 PORT=8080 npm start
 ```
 
-### AI agents through MCP
+### Participants' AI agents (AI-enabled interviews)
+
+Anyone allowed by the room's AI policy can connect their own AI agent to a Classic CoderPad or Monaco Workspace room. No server configuration or model API key is needed: the agent runs in the participant's own Claude Code, Claude Desktop, claude.ai, or other MCP client, and connects to WebCoder's room-scoped MCP endpoint.
+
+1. Open the **AI** tab next to **Output**. The interviewer chooses who may connect agents: **Off**, **Interviewers only** (the default), or **Everyone (AI-enabled)**.
+2. Click **+ Connect your Claude**, name the agent, and create the connection. Copy the setup immediately; its token is shown only once:
+   - **Claude Code:** `claude mcp add --transport http webcoder-room https://your-host/mcp/agent --header "Authorization: Bearer wca_…"`
+   - **Claude Desktop / claude.ai:** add a custom connector with the URL `https://your-host/mcp/agent/wca_…`. claude.ai connects from the internet, so the server must have a public HTTPS address.
+   - **Other clients:** Streamable HTTP at `/mcp/agent` with the `Authorization: Bearer` header.
+3. Ask the agent to join, for example: “Use the webcoder-room tools: call get_context, introduce yourself with send_message, then keep listening with wait_for_messages and reply to what people ask in the room.”
+
+Messages typed in the AI panel's chat reach every connected agent, and agent replies appear there. Everyone in the room sees all chat messages, and agent file edits, runs, and question changes appear as activity lines, so the interviewer can follow how the candidate works with AI.
+
+| Tool | Layout | Purpose |
+| --- | --- | --- |
+| `get_context` | All | Active question, code or file tree, stdin, last output, participants, agents, and latest chat message ID |
+| `send_message` / `read_messages` | All | Post to and read the room chat (Markdown supported) |
+| `wait_for_messages` | All | Wait up to 55 seconds for new messages from others after `afterId` |
+| `run_code` | All | Run like the Run button; output is shown to everyone and returned |
+| `read_code` / `write_code` / `edit_code` | Classic | Read, replace, or search-and-replace a language buffer of the active question |
+| `list_files` / `read_file` / `write_file` / `edit_file` | Workspace | Read and change workspace files |
+| `create_folder` / `rename_path` / `delete_path` / `set_entry_file` | Workspace | Manage the file tree and the file `run_code` starts from |
+| `set_question` | All | Replace the active question's Markdown; offered only to interviewers' agents |
+
+Security model:
+
+- A connection token acts as the participant who created it, with that participant's **current** role, and only in that room. It works while the room's AI policy allows that role. Interviewers' agents can change the question; interviewees' agents cannot.
+- Tokens are stored hashed. They are not affected by room password changes, so revoke connections you no longer trust: owners and interviewers can **Revoke** any listed agent, which takes effect immediately. A room can have up to 10 connections.
+- The custom-connector URL contains the token. Treat it like a password and avoid logging request URLs in any reverse proxy in front of WebCoder. Prefer the header form where the client supports it.
+- Browser requests with an Origin header are refused unless listed in `MCP_ALLOWED_ORIGINS`.
+
+### Administrator MCP
 
 WebCoder exposes a stateless Streamable HTTP MCP endpoint at **`/mcp`** on the same port as the website. It is disabled unless `MCP_TOKEN` is set. Generate a secret, store it in your service environment, and restart WebCoder:
 
@@ -135,7 +187,7 @@ Use your HTTPS website URL when connecting remotely. This endpoint uses a config
 | --- | --- |
 | `list_rooms` | List recent room summaries (`limit`, default 30, maximum 100) |
 | `get_room` | Read a room's current live questions and code using `roomId` |
-| `create_room` | Create a Classic CoderPad room with `title`, optional `language` and `password`; return its room and relative link |
+| `create_room` | Create a room with `title`, optional `language`, `password`, and `layout` (`legacy` or `workspace`); return its room and relative link |
 | `rename_room` | Update a room's `title` |
 | `add_question` | Append a question with `title`, `promptMarkdown`, optional per-language `starterCode`, and optional `activate` (default false) |
 | `edit_question` | Update `title` and/or `promptMarkdown` using `roomId` and `stageId` |
@@ -144,7 +196,7 @@ Use your HTTPS website URL when connecting remotely. This endpoint uses a config
 | `reorder_questions` | Supply all question IDs exactly once in `stageIds` |
 | `delete_question` | Delete a stage and its code; the last stage cannot be deleted |
 
-Question tools operate on Classic CoderPad rooms. `get_room` returns stage IDs in `room.stages`; each stage is a question with independent code buffers. Prompt/title edits preserve candidate code. Adding a question leaves the current stage active unless `activate: true` is supplied. Only `set_question_code` explicitly replaces existing code; it can overwrite candidate work, so use it intentionally. Deleting the active question selects a neighboring stage and restores that stage's code. All successful edits are saved before returning and broadcast to connected participants. The existing limits apply: 20 stages per room, 80 characters per title, 262,144 characters per Markdown prompt, and 524,288 characters per language's code buffer. MCP request bodies are limited to 4 MiB.
+Question tools operate on Classic CoderPad and Monaco Workspace rooms; new questions in workspace rooms start with the starter project, and `set_question_code` applies only to Classic rooms. `get_room` returns stage IDs in `room.stages`; each stage is a question with independent code buffers. Prompt/title edits preserve candidate code. Adding a question leaves the current stage active unless `activate: true` is supplied. Only `set_question_code` explicitly replaces existing code; it can overwrite candidate work, so use it intentionally. Deleting the active question selects a neighboring stage and restores that stage's code. All successful edits are saved before returning and broadcast to connected participants. The existing limits apply: 20 stages per room, 80 characters per title, 262,144 characters per Markdown prompt, and 524,288 characters per language's code buffer. MCP request bodies are limited to 4 MiB.
 
 For example, ask your agent: “Read this room, clarify the first question's examples, and add a harder Python follow-up without switching the candidate to it.” The agent can call `get_room`, `edit_question`, and `add_question` in sequence. The agent generates the content; WebCoder provides the editing tools and does not require a model API key.
 
@@ -156,7 +208,7 @@ An example systemd unit is provided in [`deploy/webcoder.service`](deploy/webcod
 
 ### Persistence
 
-- **Room content and roles:** `data/webcoder.db`, created automatically on startup. SQLite uses write-ahead logging.
+- **Room content and roles:** `data/webcoder.db`, created automatically on startup. SQLite uses write-ahead logging. Workspace files, the AI policy, room chat (the latest 2,000 messages per room), and hashed agent tokens are stored there too.
 - **Uploaded question images:** `data/uploads/<roomId>/`, retained across restarts and protected by the room password. Include this directory in backups; deleting a room deletes its uploaded images.
 - **VS Code workspace files:** named container volumes following `webcoder-vscode-<roomId>`. These are retained when a session container is removed.
 - **Interview timer:** held in server memory; it is not persisted across server restarts.
@@ -201,9 +253,11 @@ webcoder/
 ├── src/
 │   ├── auth.js              # Room passwords and signed access cookies
 │   ├── db.js                # SQLite schema, persistence, and participant roles
-│   ├── mcp.js               # Authenticated MCP room and question tools
+│   ├── mcp.js               # Administrator MCP room and question tools
+│   ├── room-mcp.js          # Room-scoped MCP endpoint for participants' agents
 │   ├── presets.js           # Problem presets and language starter code
-│   ├── runner.js            # Temporary containers for code execution
+│   ├── runner.js            # Temporary containers for single-file and workspace runs
+│   ├── workspace.js         # Multi-file workspace model, validation, and starters
 │   └── vscode.js            # Per-room VS Code containers and volumes
 ├── sandbox/
 │   ├── Dockerfile           # Classic execution image

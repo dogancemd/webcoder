@@ -17,7 +17,15 @@ const {
   getRole,
   setRole,
   listRoles,
-  hasRole
+  hasRole,
+  AI_POLICIES,
+  createAgent,
+  getAgent,
+  listAgents,
+  deleteAgent,
+  touchAgent,
+  addMessage,
+  listMessages
 } = require('./src/db');
 const {
   ROOM_SESSION_TTL_MS,
@@ -32,7 +40,9 @@ const {
 const { LANGUAGES, DEFAULT_TEMPLATES, PROBLEM_PRESETS, getPresetById } = require('./src/presets');
 const { MAX_STAGES, createStage, syncActiveStage, activateStage, getStageState } = require('./src/stages');
 const { UPLOADS_DIR, IMAGE_TYPES, saveImage } = require('./src/images');
-const { executeCode, CONTAINER_RUNTIME, SANDBOX_IMAGE } = require('./src/runner');
+const { executeCode, executeWorkspace, CONTAINER_RUNTIME, SANDBOX_IMAGE } = require('./src/runner');
+const workspaceOps = require('./src/workspace');
+const { createRoomMcpHandler, generateAgentToken, verifyAgentToken, MAX_MESSAGE_LENGTH } = require('./src/room-mcp');
 const { getVSCodeSession, destroyVSCodeSession } = require('./src/vscode');
 const httpProxy = require('http-proxy');
 const { createMcpHandler } = require('./src/mcp');
@@ -67,8 +77,12 @@ const INTERVIEWER_ONLY_ACTIONS = new Set([
   'stage_add',
   'stage_change',
   'stage_rename',
-  'stage_remove'
+  'stage_remove',
+  'ai_policy_change'
 ]);
+
+const MAX_AGENTS_PER_ROOM = 10;
+const AGENT_ONLINE_MS = 90 * 1000;
 
 // Active rooms in memory: roomId -> { data, clients: Map<ws, clientInfo>, saveTimer, isRunning, timer }
 const activeRooms = new Map();
@@ -82,6 +96,7 @@ function getActiveRoom(roomId) {
       clients: new Map(),
       saveTimer: null,
       isRunning: false,
+      agentsOnlineKey: '',
       timer: {
         running: false,
         elapsedMs: 0,
@@ -146,6 +161,338 @@ function sendTo(clientWs, payload) {
 function isInterviewer(info) {
   return info.role === 'interviewer';
 }
+
+// Drop an idle room from memory once nobody (browser or waiting agent) uses it.
+function scheduleIdleCleanup(roomId) {
+  setTimeout(() => {
+    const current = activeRooms.get(roomId);
+    if (current && current.clients.size === 0 && !current.isRunning && !(messageWaiters.get(roomId)?.size)) {
+      scheduleRoomSave(current, true);
+      activeRooms.delete(roomId);
+    }
+  }, 30000);
+}
+
+// ---- Chat and room-scoped AI agents ----
+
+// roomId -> Set<(message) => void> for agents blocked in wait_for_messages
+const messageWaiters = new Map();
+// agentId -> last request time; agents count as online while recently active
+const agentLastSeen = new Map();
+
+function postMessage(roomId, message) {
+  const saved = addMessage(roomId, message);
+  const entry = activeRooms.get(roomId);
+  if (entry) broadcast(entry, { type: 'chat_message', message: saved });
+  for (const notify of messageWaiters.get(roomId) || []) notify(saved);
+  return saved;
+}
+
+function aiAllowed(room, role) {
+  const policy = room.settings?.aiPolicy || 'interviewer';
+  return policy === 'everyone' || (policy === 'interviewer' && role === 'interviewer');
+}
+
+function agentsSnapshot(roomId) {
+  const now = Date.now();
+  return listAgents(roomId).map((agent) => ({
+    id: agent.id,
+    label: agent.label,
+    ownerId: agent.ownerIdentity,
+    ownerName: agent.ownerName,
+    createdAt: agent.createdAt,
+    online: now - Math.max(agent.lastSeenAt, agentLastSeen.get(agent.id) || 0) < AGENT_ONLINE_MS
+  }));
+}
+
+function broadcastAgents(roomId) {
+  const entry = activeRooms.get(roomId);
+  if (!entry) return;
+  const agents = agentsSnapshot(roomId);
+  entry.agentsOnlineKey = agents.filter((agent) => agent.online).map((agent) => agent.id).join(',');
+  broadcast(entry, { type: 'agents_updated', agents });
+}
+
+function markAgentSeen(agent) {
+  const now = Date.now();
+  const previous = Math.max(agent.lastSeenAt, agentLastSeen.get(agent.id) || 0);
+  agentLastSeen.set(agent.id, now);
+  if (now - agent.lastSeenAt > 60000) touchAgent(agent.id, now);
+  if (now - previous >= AGENT_ONLINE_MS) broadcastAgents(agent.roomId);
+}
+
+// Periodically flip agents to offline in rooms people are watching.
+setInterval(() => {
+  for (const [roomId, entry] of activeRooms) {
+    if (!entry.clients.size) continue;
+    const key = agentsSnapshot(roomId).filter((agent) => agent.online).map((agent) => agent.id).join(',');
+    if (key !== (entry.agentsOnlineKey || '')) broadcastAgents(roomId);
+  }
+}, 15000).unref();
+
+// ---- Shared code execution (browser Run button and agents) ----
+
+async function runRoomCode(entry, triggeredBy, { language, stdin } = {}) {
+  const room = entry.data;
+  if (entry.isRunning) throw new Error('A run is already in progress. Try again when it finishes.');
+  if (typeof stdin === 'string') room.stdin = stdin;
+  const lang = room.layout === 'workspace'
+    ? (workspaceOps.languageForPath(room.workspace?.entryFile || '') || room.language)
+    : (LANGUAGES.includes(language) ? language : room.language);
+  entry.isRunning = true;
+  broadcast(entry, { type: 'run_started', language: lang, triggeredBy, timestamp: Date.now() });
+  try {
+    const execResult = room.layout === 'workspace'
+      ? await executeWorkspace({ workspace: room.workspace, stdin: room.stdin })
+      : await executeCode({ language: lang, code: room.codes[lang], stdin: room.stdin });
+    const outputRecord = {
+      ...execResult,
+      entryFile: room.layout === 'workspace' ? room.workspace?.entryFile : undefined,
+      triggeredBy,
+      timestamp: Date.now()
+    };
+    room.lastOutput = outputRecord;
+    scheduleRoomSave(entry, true);
+    broadcast(entry, { type: 'run_finished', result: outputRecord });
+    return outputRecord;
+  } finally {
+    entry.isRunning = false;
+  }
+}
+
+// ---- Workspace helpers ----
+
+function workspaceTree(workspace) {
+  return { paths: Object.keys(workspace.files).sort(), folders: workspace.folders, entryFile: workspace.entryFile };
+}
+
+function setStageWorkspace(room, stage, workspace) {
+  stage.workspace = workspace;
+  if (stage.id === room.activeStageId) room.workspace = workspace;
+}
+
+// Applies a structural workspace operation to the active stage and broadcasts it.
+function applyWorkspaceOp(entry, { op, path: rawPath, to, content = '' }, sender) {
+  const room = entry.data;
+  const stage = room.stages.find((item) => item.id === room.activeStageId);
+  if (room.layout !== 'workspace' || !stage) throw new Error('This room has no file workspace.');
+  syncActiveStage(room);
+  let result;
+  const event = { op, created: {}, moved: [], removed: [] };
+  if (op === 'create_file') {
+    result = workspaceOps.createFile(stage.workspace, rawPath, content);
+    event.path = result.path;
+    event.created[result.path] = content;
+  } else if (op === 'create_folder') {
+    result = workspaceOps.createFolder(stage.workspace, rawPath);
+    event.path = result.path;
+  } else if (op === 'delete') {
+    result = workspaceOps.deletePath(stage.workspace, rawPath);
+    event.path = result.path;
+    event.removed = result.removed;
+  } else if (op === 'rename') {
+    result = workspaceOps.renamePath(stage.workspace, rawPath, to);
+    event.path = result.from;
+    event.to = result.to;
+    event.moved = result.moved;
+  } else if (op === 'set_entry') {
+    result = workspaceOps.setEntryFile(stage.workspace, rawPath);
+    event.path = result.path;
+  } else {
+    throw new Error('Unknown file operation.');
+  }
+  setStageWorkspace(room, stage, result.workspace);
+  scheduleRoomSave(entry, true);
+  broadcast(entry, {
+    type: 'workspace_op', stageId: stage.id, ...event, tree: workspaceTree(result.workspace),
+    senderId: sender.id, senderName: sender.name
+  });
+  return event;
+}
+
+function writeWorkspaceFile(entry, filePath, content, sender) {
+  const room = entry.data;
+  const exists = Object.hasOwn(room.workspace?.files || {}, workspaceOps.normalizePath(filePath));
+  if (!exists) return applyWorkspaceOp(entry, { op: 'create_file', path: filePath, content }, sender);
+  const stage = room.stages.find((item) => item.id === room.activeStageId);
+  const result = workspaceOps.writeFile(room.workspace, filePath, content);
+  setStageWorkspace(room, stage, result.workspace);
+  scheduleRoomSave(entry, true);
+  broadcast(entry, {
+    type: 'file_update', stageId: stage.id, path: result.path, content, force: true,
+    senderId: sender.id, senderName: sender.name
+  });
+  return { op: 'write', path: result.path };
+}
+
+function truncate(text, max = 4000) {
+  const value = String(text || '');
+  return value.length > max ? `${value.slice(0, max)}\n[truncated ${value.length - max} characters]` : value;
+}
+
+// Per-request agent session used by the room MCP tools.
+function createAgentSession(agent) {
+  const roomId = agent.roomId;
+  const entry = getActiveRoom(roomId);
+  const room = entry.data;
+  const sender = { id: `agent:${agent.id}`, name: agent.label };
+  const ownerRole = () => (getRole(roomId, agent.ownerIdentity) || {}).role || 'interviewee';
+  const activity = (text) => postMessage(roomId, { kind: 'activity', authorId: agent.id, authorName: agent.label, text });
+  const activeStage = () => room.stages.find((item) => item.id === room.activeStageId);
+  if (!entry.clients.size) scheduleIdleCleanup(roomId);
+
+  function others(messages) {
+    return messages.filter((message) => message.authorId !== agent.id && message.kind !== 'activity');
+  }
+
+  return {
+    layout: room.layout,
+    ownerRole,
+    context() {
+      syncActiveStage(room);
+      const stage = activeStage();
+      const latest = listMessages(roomId, { limit: 1 })[0];
+      const output = room.lastOutput;
+      return {
+        room: { id: room.id, title: room.title, layout: room.layout, language: room.language, aiPolicy: room.settings.aiPolicy },
+        you: { agentId: agent.id, label: agent.label, actingFor: { name: agent.ownerName, role: ownerRole() } },
+        question: {
+          stageId: stage.id,
+          title: stage.title,
+          number: room.stages.indexOf(stage) + 1,
+          totalQuestions: room.stages.length,
+          promptMarkdown: room.promptMarkdown
+        },
+        ...(room.layout === 'workspace'
+          ? { workspace: { entryFile: room.workspace.entryFile, files: Object.keys(room.workspace.files).sort(), folders: room.workspace.folders } }
+          : { code: { language: room.language, content: room.codes[room.language] } }),
+        stdin: room.stdin,
+        lastOutput: output ? {
+          ok: output.ok, exitCode: output.exitCode, timedOut: output.timedOut, durationMs: output.durationMs,
+          stdout: truncate(output.stdout), stderr: truncate(output.stderr), triggeredBy: output.triggeredBy
+        } : null,
+        participants: getParticipantsList(entry).map((p) => ({ name: p.name, role: p.role })),
+        agents: agentsSnapshot(roomId).map((a) => ({ label: a.label, ownerName: a.ownerName, online: a.online })),
+        latestMessageId: latest ? latest.id : 0
+      };
+    },
+    sendMessage(text) {
+      return postMessage(roomId, { kind: 'agent', authorId: agent.id, authorName: agent.label, text });
+    },
+    readMessages(afterId, limit) {
+      return listMessages(roomId, { afterId, limit });
+    },
+    waitForMessages(afterId, timeoutMs, signal) {
+      const pending = others(listMessages(roomId, { afterId, limit: 100 }));
+      if (pending.length) return Promise.resolve(pending);
+      return new Promise((resolve) => {
+        let waiters = messageWaiters.get(roomId);
+        if (!waiters) messageWaiters.set(roomId, waiters = new Set());
+        const finish = () => {
+          clearTimeout(timer);
+          waiters.delete(notify);
+          if (!waiters.size) messageWaiters.delete(roomId);
+          signal?.removeEventListener('abort', finish);
+          markAgentSeen(agent);
+          resolve(others(listMessages(roomId, { afterId, limit: 100 })));
+        };
+        const notify = (message) => {
+          if (message.authorId !== agent.id && message.kind !== 'activity') finish();
+        };
+        const timer = setTimeout(finish, timeoutMs);
+        waiters.add(notify);
+        signal?.addEventListener('abort', finish);
+      });
+    },
+    async run(stdin) {
+      const result = await runRoomCode(entry, agent.label, { stdin });
+      return {
+        ok: result.ok, exitCode: result.exitCode, timedOut: result.timedOut, durationMs: result.durationMs,
+        entryFile: result.entryFile, stdout: truncate(result.stdout, 16000), stderr: truncate(result.stderr, 16000)
+      };
+    },
+    listFiles() {
+      const ws = room.workspace;
+      return {
+        entryFile: ws.entryFile,
+        folders: ws.folders,
+        files: Object.keys(ws.files).sort().map((filePath) => ({
+          path: filePath, bytes: Buffer.byteLength(ws.files[filePath], 'utf8'), language: workspaceOps.languageForPath(filePath)
+        }))
+      };
+    },
+    readFile(rawPath) {
+      const filePath = workspaceOps.normalizePath(rawPath);
+      if (!Object.hasOwn(room.workspace.files, filePath)) throw new Error(`"${filePath}" does not exist. Use list_files.`);
+      return { path: filePath, content: room.workspace.files[filePath] };
+    },
+    writeFile(filePath, content) {
+      const result = writeWorkspaceFile(entry, filePath, content, sender);
+      activity(`${result.op === 'create_file' ? 'created' : 'rewrote'} \`${result.path}\``);
+      return { path: result.path, created: result.op === 'create_file' };
+    },
+    editFile(filePath, oldText, newText, replaceAll) {
+      const result = workspaceOps.editFile(room.workspace, filePath, oldText, newText, replaceAll);
+      writeWorkspaceFile(entry, result.path, result.workspace.files[result.path], sender);
+      activity(`edited \`${result.path}\``);
+      return { path: result.path };
+    },
+    fileOp(op, rawPath, to) {
+      const event = applyWorkspaceOp(entry, { op, path: rawPath, to }, sender);
+      const verbs = { create_folder: 'created folder', delete: 'deleted', rename: 'renamed', set_entry: 'set the entry file to' };
+      activity(`${verbs[op]} \`${event.path}\`${event.to ? ` → \`${event.to}\`` : ''}`);
+      return { ok: true, path: event.path, to: event.to, entryFile: room.workspace.entryFile };
+    },
+    readCode(language) {
+      const lang = language || room.language;
+      return { language: lang, code: room.codes[lang] };
+    },
+    writeCode(code, language) {
+      const lang = language || room.language;
+      room.codes[lang] = code;
+      scheduleRoomSave(entry, true);
+      broadcast(entry, { type: 'code_update', stageId: room.activeStageId, language: lang, code, senderId: sender.id, forceReplace: true });
+      activity(`rewrote the ${lang} code`);
+      return { language: lang, bytes: Buffer.byteLength(code, 'utf8') };
+    },
+    editCode(oldText, newText, replaceAll, language) {
+      const lang = language || room.language;
+      const fileName = 'code';
+      const result = workspaceOps.editFile({ files: { [fileName]: room.codes[lang] }, folders: [] }, fileName, oldText, newText, replaceAll);
+      const code = result.workspace.files[fileName];
+      if (code.length > 512 * 1024) throw new Error('Code must be 512 KiB or smaller.');
+      room.codes[lang] = code;
+      scheduleRoomSave(entry, true);
+      broadcast(entry, { type: 'code_update', stageId: room.activeStageId, language: lang, code, senderId: sender.id, forceReplace: true });
+      activity(`edited the ${lang} code`);
+      return { language: lang };
+    },
+    setQuestion(promptMarkdown) {
+      if (ownerRole() !== 'interviewer') throw new Error('Only an interviewer\'s agent can change the question.');
+      room.promptMarkdown = promptMarkdown;
+      syncActiveStage(room);
+      scheduleRoomSave(entry, true);
+      broadcast(entry, { type: 'prompt_update', stageId: room.activeStageId, promptMarkdown, senderId: sender.id });
+      activity('updated the problem statement');
+      return { stageId: room.activeStageId };
+    }
+  };
+}
+
+const handleRoomMcp = createRoomMcpHandler({
+  resolve(token) {
+    const agent = verifyAgentToken(token, getAgent);
+    if (!agent) return { status: 401, error: 'Invalid or revoked room agent token. Create a new one from the room\'s AI panel.' };
+    const room = activeRooms.get(agent.roomId)?.data || getRoom(agent.roomId);
+    if (!room || room.layout === 'vscode-server') return { status: 404, error: 'Room not found.' };
+    const role = (getRole(agent.roomId, agent.ownerIdentity) || {}).role || 'interviewee';
+    if (!aiAllowed(room, role)) {
+      return { status: 403, error: 'The interviewer has not enabled AI agents for your role in this room.' };
+    }
+    markAgentSeen(agent);
+    return { session: createAgentSession(agent) };
+  }
+});
 
 // Unique participants list, deduplicated by identityId (handles multiple tabs
 // from the same person), using the latest cursor seen across their connections.
@@ -364,6 +711,9 @@ const server = http.createServer(async (req, res) => {
     const pathname = parsedUrl.pathname;
 
     if (pathname === '/mcp') return await handleMcp(req, res);
+    if (pathname === '/mcp/agent') return await handleRoomMcp(req, res);
+    const agentUrlMatch = pathname.match(/^\/mcp\/agent\/(wca_[A-Za-z0-9_.-]+)$/);
+    if (agentUrlMatch) return await handleRoomMcp(req, res, agentUrlMatch[1]);
 
     // Per-room VS Code server reverse proxy
     const vsMatch = pathname.match(VSROOM_PATH_RE);
@@ -675,6 +1025,8 @@ wss.on('connection', (ws, req) => {
     participants: getParticipantsList(entry),
     isRunning: entry.isRunning,
     timer: getTimerSnapshot(entry.timer),
+    agents: agentsSnapshot(roomId),
+    messages: listMessages(roomId, { limit: 200 }),
     presets: PROBLEM_PRESETS.map((p) => ({
       id: p.id,
       title: p.title,
@@ -719,7 +1071,7 @@ wss.on('connection', (ws, req) => {
       case 'upload_image': {
         const room = entry.data;
         const stage = room.stages.find((item) => item.id === msg.stageId);
-        if (!stage || room.layout !== 'legacy') {
+        if (!stage || room.layout === 'vscode-server') {
           sendTo(ws, { type: 'image_upload_error', message: 'That stage no longer exists.' });
           break;
         }
@@ -750,7 +1102,7 @@ wss.on('connection', (ws, req) => {
       case 'stage_change':
       case 'stage_rename':
       case 'stage_remove': {
-        if (entry.data.layout !== 'legacy') break;
+        if (entry.data.layout === 'vscode-server') break;
         const room = entry.data;
         const title = typeof msg.title === 'string' ? msg.title.trim().slice(0, 80) : '';
         const target = room.stages.find((stage) => stage.id === msg.stageId);
@@ -760,7 +1112,8 @@ wss.on('connection', (ws, req) => {
             sendTo(ws, { type: 'action_error', message: `A room can have at most ${MAX_STAGES} stages.` });
             break;
           }
-          const stage = createStage(title || `Stage ${room.stages.length + 1}`);
+          const stage = createStage(title || `Stage ${room.stages.length + 1}`, '', DEFAULT_TEMPLATES,
+            room.layout === 'workspace' ? workspaceOps.starterWorkspace(room.language) : null);
           room.stages.push(stage);
           activateStage(room, stage);
         } else {
@@ -889,6 +1242,7 @@ wss.on('connection', (ws, req) => {
         clientInfo.cursor = {
           stageId: entry.data.activeStageId,
           language: msg.language || entry.data.language,
+          path: typeof msg.path === 'string' ? msg.path.slice(0, 200) : undefined,
           position: msg.position || null,
           selection: msg.selection || null
         };
@@ -993,6 +1347,14 @@ wss.on('connection', (ws, req) => {
       }
 
       case 'reset_template': {
+        if (entry.data.layout === 'workspace') {
+          const room = entry.data;
+          const stage = room.stages.find((item) => item.id === room.activeStageId);
+          setStageWorkspace(room, stage, workspaceOps.starterWorkspace(room.language));
+          scheduleRoomSave(entry, true);
+          broadcast(entry, { type: 'workspace_state', stageId: stage.id, workspace: room.workspace, senderName: clientInfo.name });
+          break;
+        }
         const lang = entry.data.language;
         const defaultCode = DEFAULT_TEMPLATES[lang] || '';
         entry.data.codes[lang] = defaultCode;
@@ -1016,6 +1378,12 @@ wss.on('connection', (ws, req) => {
           if (msg.replaceCode) {
             for (const lang of LANGUAGES) {
               entry.data.codes[lang] = preset.templates[lang];
+            }
+            if (entry.data.layout === 'workspace') {
+              const room = entry.data;
+              const stage = room.stages.find((item) => item.id === room.activeStageId);
+              setStageWorkspace(room, stage, workspaceOps.presetWorkspace(preset, room.language));
+              broadcast(entry, { type: 'workspace_state', stageId: stage.id, workspace: room.workspace, senderName: clientInfo.name });
             }
           }
           scheduleRoomSave(entry, true);
@@ -1065,51 +1433,106 @@ wss.on('connection', (ws, req) => {
       }
 
       case 'run_code': {
-        if (entry.isRunning) {
-          return;
+        if (entry.isRunning) break;
+        if (entry.data.layout !== 'workspace') {
+          const lang = LANGUAGES.includes(msg.language) ? msg.language : entry.data.language;
+          if (typeof msg.code === 'string' && msg.code.length <= 512 * 1024) entry.data.codes[lang] = msg.code;
         }
-        const lang = LANGUAGES.includes(msg.language)
-          ? msg.language
-          : entry.data.language;
-        if (typeof msg.code === 'string') {
-          entry.data.codes[lang] = msg.code;
-        }
-        if (typeof msg.stdin === 'string') {
-          entry.data.stdin = msg.stdin;
-        }
-
-        entry.isRunning = true;
-        const runStartedAt = Date.now();
-        broadcast(entry, {
-          type: 'run_started',
-          language: lang,
-          triggeredBy: clientInfo.name,
-          timestamp: runStartedAt
-        });
-
+        const stdin = typeof msg.stdin === 'string' && msg.stdin.length <= 128 * 1024 ? msg.stdin : undefined;
         try {
-          const execResult = await executeCode({
-            language: lang,
-            code: entry.data.codes[lang],
-            stdin: entry.data.stdin
-          });
-
-          const outputRecord = {
-            ...execResult,
-            triggeredBy: clientInfo.name,
-            timestamp: Date.now()
-          };
-
-          entry.data.lastOutput = outputRecord;
-          scheduleRoomSave(entry, true);
-
-          broadcast(entry, {
-            type: 'run_finished',
-            result: outputRecord
-          });
-        } finally {
-          entry.isRunning = false;
+          await runRoomCode(entry, clientInfo.name, { language: msg.language, stdin });
+        } catch (err) {
+          sendTo(ws, { type: 'action_error', message: err.message });
         }
+        break;
+      }
+
+      case 'file_change': {
+        const room = entry.data;
+        if (room.layout !== 'workspace') break;
+        const stage = room.stages.find((item) => item.id === (msg.stageId || room.activeStageId));
+        if (!stage || !stage.workspace || typeof msg.path !== 'string' || typeof msg.content !== 'string') break;
+        if (!Object.hasOwn(stage.workspace.files, msg.path)) break; // deleted or renamed meanwhile
+        if (Buffer.byteLength(msg.content, 'utf8') > workspaceOps.MAX_FILE_BYTES) {
+          sendTo(ws, { type: 'action_error', message: 'Files must be 512 KiB or smaller.' });
+          break;
+        }
+        stage.workspace.files[msg.path] = msg.content;
+        scheduleRoomSave(entry);
+        broadcast(entry, {
+          type: 'file_update', stageId: stage.id, path: msg.path, content: msg.content, senderId: clientInfo.identityId
+        }, ws);
+        break;
+      }
+
+      case 'file_op': {
+        if (entry.data.layout !== 'workspace') break;
+        if (msg.stageId && msg.stageId !== entry.data.activeStageId) break;
+        try {
+          applyWorkspaceOp(entry, {
+            op: msg.op, path: msg.path, to: msg.to, content: typeof msg.content === 'string' ? msg.content : ''
+          }, { id: clientInfo.identityId, name: clientInfo.name });
+        } catch (err) {
+          sendTo(ws, { type: 'action_error', message: err.message });
+        }
+        break;
+      }
+
+      case 'workspace_sync': {
+        if (entry.data.layout !== 'workspace') break;
+        sendTo(ws, { type: 'workspace_state', stageId: entry.data.activeStageId, workspace: entry.data.workspace });
+        break;
+      }
+
+      case 'chat_send': {
+        const text = typeof msg.text === 'string' ? msg.text.trim() : '';
+        if (!text || text.length > MAX_MESSAGE_LENGTH) break;
+        postMessage(roomId, { kind: 'human', authorId: clientInfo.identityId, authorName: clientInfo.name, text });
+        break;
+      }
+
+      case 'ai_policy_change': {
+        if (!AI_POLICIES.includes(msg.policy)) break;
+        entry.data.settings = { ...entry.data.settings, aiPolicy: msg.policy };
+        scheduleRoomSave(entry, true);
+        broadcast(entry, { type: 'settings_updated', settings: entry.data.settings, byName: clientInfo.name });
+        const labels = { off: 'disabled AI agents', interviewer: 'allowed AI agents for interviewers only', everyone: 'allowed AI agents for everyone' };
+        postMessage(roomId, { kind: 'system', authorName: clientInfo.name, text: `${clientInfo.name} ${labels[msg.policy]}.` });
+        break;
+      }
+
+      case 'agent_create': {
+        if (entry.data.layout === 'vscode-server') break;
+        if (!aiAllowed(entry.data, clientInfo.role)) {
+          sendTo(ws, { type: 'permission_denied', action: 'agent_create', message: 'The interviewer has not enabled AI agents for your role.' });
+          break;
+        }
+        if (listAgents(roomId).length >= MAX_AGENTS_PER_ROOM) {
+          sendTo(ws, { type: 'action_error', message: `A room can have at most ${MAX_AGENTS_PER_ROOM} agent connections. Revoke one first.` });
+          break;
+        }
+        const label = (typeof msg.label === 'string' ? msg.label.trim().slice(0, 40) : '') || `${clientInfo.name}'s Claude`;
+        const { id, token, tokenHash } = generateAgentToken();
+        const agent = createAgent({
+          id, roomId, tokenHash, ownerIdentity: clientInfo.identityId, ownerName: clientInfo.name, label
+        });
+        sendTo(ws, { type: 'agent_created', agentId: agent.id, label: agent.label, token });
+        broadcastAgents(roomId);
+        postMessage(roomId, { kind: 'system', authorName: clientInfo.name, text: `${clientInfo.name} created an agent connection: ${label}.` });
+        break;
+      }
+
+      case 'agent_revoke': {
+        const agent = getAgent(String(msg.agentId || ''));
+        if (!agent || agent.roomId !== roomId) break;
+        if (agent.ownerIdentity !== clientInfo.identityId && !isInterviewer(clientInfo)) {
+          sendTo(ws, { type: 'permission_denied', action: 'agent_revoke', message: 'Only its owner or an interviewer can revoke an agent.' });
+          break;
+        }
+        deleteAgent(agent.id);
+        agentLastSeen.delete(agent.id);
+        broadcastAgents(roomId);
+        postMessage(roomId, { kind: 'system', authorName: clientInfo.name, text: `${clientInfo.name} revoked ${agent.label}.` });
         break;
       }
     }
@@ -1126,12 +1549,7 @@ wss.on('connection', (ws, req) => {
     } else {
       // Flush pending save and clean up memory after last user leaves
       scheduleRoomSave(entry, true);
-      setTimeout(() => {
-        const current = activeRooms.get(roomId);
-        if (current && current.clients.size === 0 && !current.isRunning) {
-          activeRooms.delete(roomId);
-        }
-      }, 30000);
+      scheduleIdleCleanup(roomId);
     }
   });
 });

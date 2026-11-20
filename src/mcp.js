@@ -4,6 +4,7 @@ const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/ser
 const { z } = require('zod');
 const { LANGUAGES, DEFAULT_TEMPLATES } = require('./presets');
 const { MAX_STAGES, createStage, syncActiveStage, activateStage } = require('./stages');
+const { starterWorkspace } = require('./workspace');
 
 const roomId = z.string().regex(/^[a-zA-Z0-9_-]+$/).max(128);
 const stageId = z.string().min(1).max(128);
@@ -31,7 +32,7 @@ function createMcpServer(api) {
   }
   function mutate(id, action) {
     const room = structuredClone(api.getRoom(id));
-    if (room.layout !== 'legacy') throw new Error('Question tools require a Classic CoderPad room.');
+    if (room.layout === 'vscode-server') throw new Error('Question tools require a Classic CoderPad or Monaco Workspace room.');
     syncActiveStage(room);
     const events = [];
     action(room, events);
@@ -49,8 +50,9 @@ function createMcpServer(api) {
   }, ({ limit }) => ({ rooms: api.listRooms(limit) }), false, true);
   tool('get_room', 'Read a room, its questions, active stage and current code buffers.', { roomId },
     ({ roomId }) => ({ room: api.getRoom(roomId) }), false, true);
-  tool('create_room', 'Create a Classic CoderPad room and return its relative browser link. No container is started.', {
-    title, language: z.enum(LANGUAGES).default('python'), password: z.string().max(256).optional()
+  tool('create_room', 'Create a room and return its relative browser link. layout "legacy" is the Classic CoderPad; "workspace" is the multi-file Monaco Workspace. No container is started.', {
+    title, language: z.enum(LANGUAGES).default('python'), password: z.string().max(256).optional(),
+    layout: z.enum(['legacy', 'workspace']).default('legacy')
   }, (args) => {
     const room = api.createRoom(args);
     return { room, path: `/room/${room.id}` };
@@ -65,7 +67,8 @@ function createMcpServer(api) {
     roomId, title, promptMarkdown, starterCode: starterCode.optional(), activate: z.boolean().default(false)
   }, ({ roomId, title, promptMarkdown, starterCode, activate }) => mutate(roomId, (room) => {
     if (room.stages.length >= MAX_STAGES) throw new Error(`A room can have at most ${MAX_STAGES} stages.`);
-    const stage = createStage(title, promptMarkdown, { ...DEFAULT_TEMPLATES, ...starterCode });
+    const stage = createStage(title, promptMarkdown, { ...DEFAULT_TEMPLATES, ...starterCode },
+      room.layout === 'workspace' ? starterWorkspace(room.language) : null);
     room.stages.push(stage);
     if (activate) activateStage(room, stage);
   }));
@@ -84,6 +87,7 @@ function createMcpServer(api) {
   tool('set_question_code', 'Explicitly REPLACE the current code buffer for one language in a question, including candidate work. Use edit_question for prompt-only edits.', {
     roomId, stageId, language: z.enum(LANGUAGES), code
   }, ({ roomId, stageId, language, code }) => mutate(roomId, (room, events) => {
+    if (room.layout === 'workspace') throw new Error('Monaco Workspace rooms use files; participants edit them in the room.');
     question(room, stageId).codes[language] = code;
     events.push({ type: 'code_update', stageId, language, code });
   }), true);
