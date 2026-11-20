@@ -7,3 +7,6 @@
 
 # Installed dependencies
 /node_modules/
+
+# Local configuration loaded by npm start / npm run dev
+/.env

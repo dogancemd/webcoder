@@ -98,7 +98,14 @@ Set environment variables when starting the server:
 | `MCP_ALLOWED_ORIGINS` | empty | Comma-separated browser Origin values allowed on authenticated MCP requests; requests without Origin are accepted |
 | `VSCODE_IMAGE` | `webcoder-vscode:latest` | Image used for VS Code room containers |
 
-For example, to listen locally on a different port:
+`npm start` and `npm run dev` also read an optional `.env` file in the project directory (see [`.env.example`](.env.example)); variables already set in the shell take precedence. For example, to keep a fixed local address for a reverse proxy or tunnel:
+
+```bash
+cp .env.example .env   # HOST=127.0.0.1, PORT=31311
+npm start
+```
+
+Or, to listen locally on a different port for one run:
 
 ```bash
 HOST=127.0.0.1 PORT=8080 npm start
