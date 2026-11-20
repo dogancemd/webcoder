@@ -81,7 +81,7 @@
         <div class="ws-tree" role="tree"></div>
         <div class="ws-explorer-foot">Right-click for more · drag to move</div>
       </aside>
-      <div class="resizer-h" id="explorerResizer" hidden title="Drag to resize the file tree"></div>
+      <div id="problemView" class="problem-view">
       <div class="pane-header">
         <div class="pane-title">
           <button type="button" class="tab-btn active" id="promptPreviewTab">Preview</button>
@@ -109,6 +109,7 @@
         <div id="promptPreview" class="markdown-view"></div>
         <textarea id="promptEditor" class="prompt-editor" style="display: none;" placeholder="Write problem description in Markdown..."></textarea>
       </div>
+      </div>
     </section>
 
     <div class="resizer-v" id="resizerLeft"></div>
@@ -132,7 +133,6 @@
           <span id="syncIndicator" style="font-size: 11px; color: #2fbf8f; text-transform: none; font-weight: 500;">● Live</span>
         </div>
         <div class="pane-actions">
-          <button type="button" class="btn btn-subtle" id="toggleExplorerBtn" hidden title="Show/Hide file explorer">☰ Files</button>
           <button type="button" class="btn btn-subtle" id="resetTemplateBtn" style="padding: 3px 8px; font-size: 11.5px;">Reset Starter Code</button>
           <select id="fontSizeSelect" class="mini-select" title="Editor Font Size">
             <option value="13">13px</option>
@@ -156,6 +156,7 @@
     <section class="legacy-pane legacy-pane-output" id="outputPane">
       <div class="pane-header">
         <div class="pane-title">
+          <button type="button" class="tab-btn" id="problemTab" hidden title="Problem statement">Problem <span id="problemDot" class="tab-dot" hidden></span></button>
           <button type="button" class="tab-btn active" id="outputTab">Output</button>
           <button type="button" class="tab-btn" id="aiTab" title="Chat with the room and connected AI agents">AI <span id="aiUnread" class="ai-unread" hidden></span></button>
         </div>

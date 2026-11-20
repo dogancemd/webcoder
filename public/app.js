@@ -98,10 +98,11 @@
   const toastEl = $('toast');
   const remoteCursorStyles = $('remoteCursorStyles');
   const languagePicker = $('languagePicker');
-  const toggleExplorerBtn = $('toggleExplorerBtn');
   const wsExplorer = $('wsExplorer');
   const wsTabs = $('wsTabs');
-  const explorerResizer = $('explorerResizer');
+  const problemView = $('problemView');
+  const problemTab = $('problemTab');
+  const problemDot = $('problemDot');
   const outputTab = $('outputTab');
   const aiTab = $('aiTab');
   const aiUnread = $('aiUnread');
@@ -164,11 +165,15 @@
     document.body.classList.add('workspace-mode');
     languagePicker.hidden = true;
     wsExplorer.hidden = false;
-    explorerResizer.hidden = false;
     wsTabs.hidden = false;
-    toggleExplorerBtn.hidden = false;
-    toggleExplorerBtn.classList.add('active');
-    togglePromptBtn.textContent = '◧ Files & Problem';
+    // CoderPad-style: files on the left, editor in the middle, and the
+    // problem as a tab next to Output and AI on the right.
+    outputPane.insertBefore(problemView, outputView);
+    collapsePromptBtn.hidden = true;
+    problemTab.hidden = false;
+    togglePromptBtn.textContent = '◧ Files';
+    togglePromptBtn.title = 'Show/Hide file explorer';
+    showRightTab('problem');
     resetTemplateBtn.textContent = 'Reset Workspace';
     resetTemplateBtn.title = 'Replace this stage\'s files with the starter project';
     workspaceCtl = window.WebCoderWorkspace.createWorkspaceController({
@@ -585,6 +590,7 @@
   function triggerRunCode() {
     if (isRunning) return;
     flushCodeChange();
+    if (rightTab !== 'output') showRightTab('output');
     if (isWorkspace) {
       sendWs({ type: 'run_code', stdin: stdinTextarea.value });
       return;
@@ -762,6 +768,7 @@
             activeStageId = msg.activeStageId;
             const stage = stages.find((item) => item.id === activeStageId);
             updatePromptUI(stage ? stage.promptMarkdown : '', true);
+            markProblemChanged();
             codes = stage ? stage.codes : {};
             if (workspaceCtl) workspaceCtl.load(activeStageId, stage && stage.workspace);
             setEditorValue(codes[currentLanguage] || '', currentLanguage);
@@ -788,7 +795,10 @@
         case 'prompt_update': {
           const stage = stages.find((item) => item.id === msg.stageId);
           if (stage) stage.promptMarkdown = msg.promptMarkdown;
-          if (!msg.stageId || msg.stageId === activeStageId) updatePromptUI(msg.promptMarkdown, true);
+          if (!msg.stageId || msg.stageId === activeStageId) {
+            updatePromptUI(msg.promptMarkdown, true);
+            if (msg.senderId !== selfId) markProblemChanged();
+          }
           break;
         }
         case 'stdin_update': stdinTextarea.value = msg.stdin; break;
@@ -1020,46 +1030,26 @@
     setPaneCollapsed(side, !pane.classList.contains('collapsed'));
   }
   togglePromptBtn.addEventListener('click', () => togglePane('left'));
-  toggleExplorerBtn.addEventListener('click', () => {
-    const show = wsExplorer.hidden || promptPane.classList.contains('collapsed');
-    if (show && promptPane.classList.contains('collapsed')) setPaneCollapsed('left', false);
-    wsExplorer.hidden = !show;
-    explorerResizer.hidden = !show;
-    toggleExplorerBtn.classList.toggle('active', show);
-    if (editor) editor.layout();
-  });
-
-  // Drag the divider between the file tree and the problem in the left pane.
-  explorerResizer.addEventListener('mousedown', (e) => {
-    e.preventDefault();
-    const top = wsExplorer.getBoundingClientRect().top;
-    const paneBottom = promptPane.getBoundingClientRect().bottom;
-    explorerResizer.classList.add('dragging');
-    document.body.style.cursor = 'row-resize';
-    const move = (event) => {
-      wsExplorer.style.height = `${Math.max(80, Math.min(paneBottom - top - 120, event.clientY - top))}px`;
-    };
-    const up = () => {
-      explorerResizer.classList.remove('dragging');
-      document.body.style.cursor = '';
-      window.removeEventListener('mousemove', move);
-      window.removeEventListener('mouseup', up);
-    };
-    window.addEventListener('mousemove', move);
-    window.addEventListener('mouseup', up);
-  });
-
   // Output / AI tabs in the right pane
+  let rightTab = 'output';
   function showRightTab(tab) {
-    const ai = tab === 'ai';
-    outputTab.classList.toggle('active', !ai);
-    aiTab.classList.toggle('active', ai);
-    outputView.hidden = ai;
-    aiPanelEl.hidden = !ai;
-    clearOutputBtn.hidden = ai;
-    aiPanel.setVisible(ai);
-    if (ai && outputPane.classList.contains('collapsed')) setPaneCollapsed('right', false);
+    rightTab = tab;
+    outputTab.classList.toggle('active', tab === 'output');
+    aiTab.classList.toggle('active', tab === 'ai');
+    problemTab.classList.toggle('active', tab === 'problem');
+    outputView.hidden = tab !== 'output';
+    aiPanelEl.hidden = tab !== 'ai';
+    if (isWorkspace) problemView.hidden = tab !== 'problem';
+    if (tab === 'problem') problemDot.hidden = true;
+    clearOutputBtn.hidden = tab !== 'output';
+    aiPanel.setVisible(tab === 'ai');
+    if (outputPane.classList.contains('collapsed')) setPaneCollapsed('right', false);
   }
+  // Flag a changed question when the Problem tab is not showing.
+  function markProblemChanged() {
+    if (isWorkspace && rightTab !== 'problem') problemDot.hidden = false;
+  }
+  problemTab.addEventListener('click', () => showRightTab('problem'));
   outputTab.addEventListener('click', () => showRightTab('output'));
   aiTab.addEventListener('click', () => showRightTab('ai'));
   toggleOutputBtn.addEventListener('click', () => togglePane('right'));
